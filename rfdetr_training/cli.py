@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import argparse
 import sys
+import os
 from pathlib import Path
 from typing import List
 
-from .coco import validate_coco_split
-from .datasets import create_dataset, yolo_to_coco
+from .coco import (
+    align_coco_categories_to_metadata,
+    ensure_minimal_test_split,
+    normalize_coco_category_ids,
+    reset_coco_dir,
+    validate_coco_split,
+)
+from .coco_merge import merge_coco_into_split
+from .datasets import create_dataset, load_metadata, yolo_to_coco
+from .export import export_onnx, export_tensorrt_from_onnx
+from .ingest import ingest_labels_inbox
 from .train import TrainConfig, train
 
 
@@ -38,6 +48,40 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rfdetrw", description="RF-DETR training workspace (CLI)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # doctor
+    sub.add_parser("doctor", help="Check environment and print common fix hints")
+
+    # export
+    ex = sub.add_parser("export", help="Export a trained model for deployment (ONNX / TensorRT)")
+    ex.add_argument("--dataset-dir", "-d", required=True)
+    ex.add_argument("--weights", "-w", required=True, help="Checkpoint path (.pth)")
+    ex.add_argument("--task", choices=["detect", "seg"], default="detect")
+    ex.add_argument("--size", choices=["nano", "small", "base", "medium"], default="nano", help="Detection model size (ignored if using checkpoint model)")
+    ex.add_argument("--format", choices=["onnx", "tensorrt"], default="onnx")
+    ex.add_argument("--output", "-o", default=None, help="Output path (.onnx or .engine). Default: datasets/<UUID>/exports/")
+    ex.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
+    ex.add_argument("--height", type=int, default=640)
+    ex.add_argument("--width", type=int, default=640)
+    ex.add_argument("--opset", type=int, default=17, help="ONNX opset")
+    ex.add_argument("--dynamic", action="store_true", help="Dynamic input H/W axes (ONNX only)")
+    ex.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
+    ex.add_argument("--checkpoint-key", default=None, help="Explicit key inside checkpoint that contains state_dict")
+    ex.add_argument(
+        "--strict",
+        dest="strict",
+        action="store_true",
+        default=True,
+        help="Fail if checkpoint does not match model exactly (recommended for deployment). Default: enabled.",
+    )
+    ex.add_argument(
+        "--non-strict",
+        dest="strict",
+        action="store_false",
+        help="Allow partial checkpoint loads (debugging only; can cause subtle deployment bugs).",
+    )
+    ex.add_argument("--fp16", action="store_true", help="TensorRT: build FP16 engine")
+    ex.add_argument("--workspace-mb", type=int, default=2048, help="TensorRT: workspace size in MB")
+
     # dataset
     ds = sub.add_parser("dataset", help="Dataset utilities")
     ds_sub = ds.add_subparsers(dest="dataset_cmd", required=True)
@@ -58,6 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     ds_y2c.add_argument("--seed", type=int, default=0)
     ds_y2c.add_argument("--copy-images", action="store_true")
     ds_y2c.add_argument("--images-ext", default="jpg,png")
+    ds_y2c.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory for generated COCO (default: <dataset>/coco). Useful for mixed COCO+YOLO workflows.",
+    )
     ds_y2c.add_argument("--validate", action="store_true")
     ds_y2c.add_argument("--validate-only", action="store_true")
 
@@ -66,6 +115,54 @@ def build_parser() -> argparse.ArgumentParser:
     ds_val.add_argument("--task", choices=["detect", "seg"], default="detect")
     ds_val.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
     ds_val.add_argument("--check-images", action="store_true", help="Warn if image files are missing from split dir")
+
+    ds_norm = ds_sub.add_parser("normalize-coco-ids", help="Normalize COCO category ids to contiguous 0..N-1 (safe backup)")
+    ds_norm.add_argument("--dataset-dir", "-d", required=True)
+    ds_norm.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
+    ds_norm.add_argument("--dry-run", action="store_true")
+
+    ds_align = ds_sub.add_parser("align-metadata", help="Align COCO categories to METADATA.json class_names (fix wrong num_classes)")
+    ds_align.add_argument("--dataset-dir", "-d", required=True)
+    ds_align.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
+    ds_align.add_argument("--dry-run", action="store_true")
+
+    ds_reset = ds_sub.add_parser("reset-coco", help="Reset coco/ splits to empty (backs up existing coco/)")
+    ds_reset.add_argument("--dataset-dir", "-d", required=True)
+    ds_reset.add_argument("--no-backup", action="store_true", help="Do not move existing coco/ to a backup folder")
+
+    ds_imp = ds_sub.add_parser("import-coco", help="Import/merge an external COCO JSON (and images) into this dataset split")
+    ds_imp.add_argument("--dataset-dir", "-d", required=True)
+    ds_imp.add_argument("--split", choices=["train", "valid", "test"], default="train")
+    ds_imp.add_argument("--coco-json", required=True, help="Path to source _annotations.coco.json")
+    ds_imp.add_argument("--images-dir", default=None, help="Folder containing images referenced by COCO file_name")
+    ds_imp.add_argument("--mode", choices=["copy", "move"], default="copy")
+    ds_imp.add_argument("--rename", action="store_true", help="Rename imported images to sequential numbers to avoid collisions")
+    ds_imp.add_argument("--pad", type=int, default=6, help="Zero-pad width when renaming (default: 6)")
+    ds_imp.add_argument("--align-metadata", action="store_true", help="Map categories to METADATA.json class_names by name")
+    ds_imp.add_argument("--dry-run", action="store_true")
+
+    ds_ing = ds_sub.add_parser("ingest", help="Ingest mixed labels from labels_inbox/ into coco/ (YOLO + COCO)")
+    ds_ing.add_argument("--dataset-dir", "-d", required=True)
+    ds_ing.add_argument("--train-ratio", type=float, default=0.8)
+    ds_ing.add_argument("--seed", type=int, default=0)
+    ds_ing.add_argument("--yolo-task", choices=["detect", "seg"], default="detect", help="How to interpret YOLO labels during conversion")
+    ds_ing.add_argument("--images-ext", default="jpg,png", help="Comma-separated image extensions under raw/ (default: jpg,png)")
+    ds_ing.add_argument("--mode", choices=["copy", "move"], default="copy", help="Copy/move images into coco splits (default: copy)")
+    ds_ing.add_argument(
+        "--include-background",
+        action="store_true",
+        default=True,
+        help="Include unlabeled images from raw/ as background (empty annotations). Default: enabled.",
+    )
+    ds_ing.add_argument(
+        "--no-include-background",
+        dest="include_background",
+        action="store_false",
+        help="Do not include unlabeled images from raw/.",
+    )
+    ds_ing.add_argument("--no-align-metadata", dest="align_metadata", action="store_false", help="Do not align COCO categories to METADATA.json")
+    ds_ing.set_defaults(align_metadata=True)
+    ds_ing.add_argument("--dry-run", action="store_true")
 
     # train
     tr = sub.add_parser("train", help="Train an RF-DETR model")
@@ -76,13 +173,22 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--batch-size", type=int, default=4)
     tr.add_argument("--grad-accum", type=int, default=4)
     tr.add_argument("--lr", type=float, default=1e-4)
+    tr.add_argument("--device", default=None, help="Device string passed to RF-DETR trainer (e.g. cuda, cuda:0, cpu)")
+    tr.add_argument("--num-workers", type=int, default=None, help="Dataloader workers (Windows recommended: 0)")
+    tr.add_argument("--resolution", type=int, default=None, help="Training resolution; must be divisible by 32 (often 224 works well)")
     tr.add_argument("--output-dir", "-o", default=None)
     tr.add_argument("--pretrained", action="store_true")
     tr.add_argument("--pretrain-weights", default=None)
     tr.add_argument("--tensorboard", action="store_true")
     tr.add_argument("--wandb", action="store_true")
     tr.add_argument("--early-stopping", action="store_true")
-    tr.add_argument("--skip-eval", action="store_true")
+    tr.add_argument(
+        "--eval-only",
+        "--eval",
+        dest="eval_only",
+        action="store_true",
+        help="Run evaluation only and exit (no training).",
+    )
     tr.add_argument("--num-queries", type=int, default=None)
     tr.add_argument("--num-select", type=int, default=None)
     tr.add_argument("--run-test", action="store_true")
@@ -94,13 +200,51 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
     tr.add_argument("--checkpoint-key", default=None, help="Explicit key inside checkpoint that contains state_dict")
 
-    tr.add_argument("--patch-inference-mode", action="store_true", help="Workaround: patch torch.inference_mode -> enable_grad")
+    tr.add_argument(
+        "--patch-inference-mode",
+        action="store_true",
+        default=None,
+        help="Workaround: patch torch.inference_mode -> enable_grad (default: auto on Windows)",
+    )
+    tr.add_argument(
+        "--no-patch-inference-mode",
+        dest="patch_inference_mode",
+        action="store_false",
+        help="Disable inference_mode patch (if auto-enabled)",
+    )
     tr.add_argument("--no-validate", action="store_true", help="Skip dataset validation checks")
     return p
 
 
 def main(argv: List[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.cmd == "doctor":
+        # keep this lightweight: just print versions and common hints.
+        print("rfdetr_training doctor")
+        print(f"- platform: {sys.platform}")
+        print(f"- python: {sys.version.split()[0]}")
+        try:
+            import torch  # type: ignore
+
+            print(f"- torch: {torch.__version__}")
+            print(f"- cuda available: {torch.cuda.is_available()}")
+        except Exception as e:
+            print(f"- torch: not importable ({e})")
+
+        try:
+            import rfdetr  # type: ignore
+
+            ver = getattr(rfdetr, "__version__", None)
+            print(f"- rfdetr: {ver or 'importable'}")
+        except Exception as e:
+            print(f"- rfdetr: not importable ({e})")
+
+        if os.name == "nt":
+            print("- hint: on Windows, set --num-workers 0 to avoid multiprocessing issues")
+        print("- hint: if you see 'Inference tensors cannot be saved for backward', enable --patch-inference-mode")
+        print("- hint: if you see OOM, reduce --batch-size/--resolution or set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+        return 0
 
     if args.cmd == "dataset" and args.dataset_cmd == "create":
         try:
@@ -131,6 +275,7 @@ def main(argv: List[str] | None = None) -> int:
                 exts=exts,
                 validate=bool(args.validate),
                 validate_only=bool(args.validate_only),
+                out_dir=(Path(args.out_dir) if args.out_dir else None),
             )
             return 0
         except Exception as e:
@@ -140,6 +285,10 @@ def main(argv: List[str] | None = None) -> int:
     if args.cmd == "dataset" and args.dataset_cmd == "validate":
         dataset_dir = Path(args.dataset_dir).expanduser().resolve()
         coco_dir = dataset_dir / "coco"
+        if args.split in ("all", "test"):
+            created = ensure_minimal_test_split(coco_dir)
+            if created is not None:
+                print(f"Note: created minimal test split annotations at {created}")
         splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
         ok = True
         for sp in splits:
@@ -155,6 +304,130 @@ def main(argv: List[str] | None = None) -> int:
                 print(f"{sp}: Error: {e}", file=sys.stderr)
         return 0 if ok else 3
 
+    if args.cmd == "dataset" and args.dataset_cmd == "normalize-coco-ids":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        coco_dir = dataset_dir / "coco"
+        splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
+        ok = True
+        for sp in splits:
+            ann_path = coco_dir / sp / "_annotations.coco.json"
+            success, msg = normalize_coco_category_ids(ann_path, dry_run=bool(args.dry_run))
+            if success:
+                print(msg)
+            else:
+                ok = False
+                print(f"{sp}: {msg}", file=sys.stderr)
+
+        # best-effort sync METADATA.json class_names from normalized categories (train split)
+        if ok and not args.dry_run:
+            md_path = dataset_dir / "METADATA.json"
+            if md_path.exists():
+                try:
+                    import json
+
+                    train_ann = coco_dir / "train" / "_annotations.coco.json"
+                    cats = json.loads(train_ann.read_text(encoding="utf-8")).get("categories", []) or []
+                    cats = sorted(cats, key=lambda c: int(c.get("id", 0)))
+                    class_names = [str(c.get("name", c.get("id"))) for c in cats]
+                    md = load_metadata(dataset_dir)
+                    md["class_names"] = class_names
+                    md_path.write_text(json.dumps(md, indent=2), encoding="utf-8")
+                    print(f"Updated METADATA.json class_names from COCO categories: {md_path}")
+                except Exception as e:
+                    print(f"Warning: could not update METADATA.json: {e}", file=sys.stderr)
+
+        return 0 if ok else 3
+
+    if args.cmd == "dataset" and args.dataset_cmd == "align-metadata":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        coco_dir = dataset_dir / "coco"
+        md = load_metadata(dataset_dir)
+        class_names = md.get("class_names", []) or []
+        if not class_names:
+            print(f"Error: METADATA.json has empty class_names: {dataset_dir / 'METADATA.json'}", file=sys.stderr)
+            return 2
+
+        splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
+        ok = True
+        for sp in splits:
+            ann_path = coco_dir / sp / "_annotations.coco.json"
+            success, msg = align_coco_categories_to_metadata(ann_path, class_names=class_names, dry_run=bool(args.dry_run))
+            if success:
+                print(msg)
+            else:
+                ok = False
+                print(f"{sp}: {msg}", file=sys.stderr)
+        return 0 if ok else 3
+
+    if args.cmd == "dataset" and args.dataset_cmd == "reset-coco":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        ok, msg = reset_coco_dir(dataset_dir, backup=(not bool(args.no_backup)))
+        if not ok:
+            print(f"Error: {msg}", file=sys.stderr)
+            return 2
+        print(msg)
+        return 0
+
+    if args.cmd == "dataset" and args.dataset_cmd == "import-coco":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        src_json = Path(args.coco_json)
+        src_images = Path(args.images_dir) if args.images_dir else None
+
+        metadata_map = None
+        if args.align_metadata:
+            md = load_metadata(dataset_dir)
+            class_names = md.get("class_names", []) or []
+            metadata_map = {str(name): idx for idx, name in enumerate(class_names)}
+
+        res = merge_coco_into_split(
+            dataset_dir=dataset_dir,
+            split=args.split,
+            src_json=src_json,
+            src_images_dir=src_images,
+            mode=args.mode,
+            rename=bool(args.rename),
+            pad=int(args.pad),
+            metadata_map=metadata_map,
+            dry_run=bool(args.dry_run),
+        )
+        if not res.ok:
+            print(f"Error: {res.message}", file=sys.stderr)
+            return 2
+        print(res.message)
+
+        # keep categories aligned and stable if requested
+        if args.align_metadata:
+            md = load_metadata(dataset_dir)
+            class_names = md.get("class_names", []) or []
+            if class_names:
+                ann_path = dataset_dir / "coco" / args.split / "_annotations.coco.json"
+                ok2, msg2 = align_coco_categories_to_metadata(ann_path, class_names=class_names, dry_run=False)
+                if not ok2:
+                    print(f"Warning: {msg2}", file=sys.stderr)
+                else:
+                    print(f"Note: {msg2}")
+
+        return 0
+
+    if args.cmd == "dataset" and args.dataset_cmd == "ingest":
+        exts = [e.strip().lower() for e in args.images_ext.split(",") if e.strip()]
+        res = ingest_labels_inbox(
+            dataset_dir=Path(args.dataset_dir),
+            train_ratio=float(args.train_ratio),
+            seed=int(args.seed),
+            yolo_task=args.yolo_task,
+            images_ext=exts,
+            mode=args.mode,
+            align_metadata=bool(args.align_metadata),
+            include_background=bool(args.include_background),
+            dry_run=bool(args.dry_run),
+        )
+        if not res.ok:
+            print(f"Error: {res.message}", file=sys.stderr)
+            return 2
+        print(res.message)
+        return 0
+
     if args.cmd == "train":
         cfg = TrainConfig(
             dataset_dir=Path(args.dataset_dir),
@@ -164,13 +437,16 @@ def main(argv: List[str] | None = None) -> int:
             batch_size=int(args.batch_size),
             grad_accum=int(args.grad_accum),
             lr=float(args.lr),
+            device=args.device,
+            num_workers=args.num_workers,
+            resolution=args.resolution,
             output_dir=(Path(args.output_dir) if args.output_dir else None),
             pretrained=bool(args.pretrained),
             pretrain_weights=args.pretrain_weights,
             tensorboard=bool(args.tensorboard),
             wandb=bool(args.wandb),
             early_stopping=bool(args.early_stopping),
-            eval=(not bool(args.skip_eval)),
+            eval_only=bool(getattr(args, "eval_only", False)),
             num_queries=args.num_queries,
             num_select=args.num_select,
             run_test=bool(args.run_test),
@@ -179,11 +455,80 @@ def main(argv: List[str] | None = None) -> int:
             finetune_from=args.finetune_from,
             use_checkpoint_model=bool(args.use_checkpoint_model),
             checkpoint_key=args.checkpoint_key,
-            patch_inference_mode=bool(args.patch_inference_mode),
+            patch_inference_mode=args.patch_inference_mode,
             validate_dataset=(not bool(args.no_validate)),
         )
         return int(train(cfg))
 
+    if args.cmd == "export":
+        dataset_dir = Path(args.dataset_dir)
+        weights = Path(args.weights)
+        out = Path(args.output) if args.output else None
+
+        if args.format == "onnx":
+            res = export_onnx(
+                dataset_dir=dataset_dir,
+                weights=weights,
+                task=args.task,
+                size=args.size,
+                output=out,
+                device=args.device,
+                height=int(args.height),
+                width=int(args.width),
+                opset=int(args.opset),
+                dynamic=bool(args.dynamic),
+                use_checkpoint_model=bool(args.use_checkpoint_model),
+                checkpoint_key=args.checkpoint_key,
+                strict=bool(args.strict),
+            )
+            if not res.ok:
+                print(f"Error: {res.message}", file=sys.stderr)
+                return 2
+            print(res.message)
+            return 0
+
+        # tensorrt: export ONNX first (static by design), then build engine via trtexec
+        tmp_onnx = None
+        if out is not None and out.suffix.lower() == ".onnx":
+            tmp_onnx = out
+            engine_out = out.with_suffix(".engine")
+        elif out is not None and out.suffix.lower() == ".engine":
+            engine_out = out
+            tmp_onnx = out.with_suffix(".onnx")
+        else:
+            engine_out = out
+
+        onnx_res = export_onnx(
+            dataset_dir=dataset_dir,
+            weights=weights,
+            task=args.task,
+            size=args.size,
+            output=tmp_onnx,
+            device=args.device,
+            height=int(args.height),
+            width=int(args.width),
+            opset=int(args.opset),
+            dynamic=False,
+            use_checkpoint_model=bool(args.use_checkpoint_model),
+            checkpoint_key=args.checkpoint_key,
+        )
+        if not onnx_res.ok or onnx_res.output_path is None:
+            print(f"Error: {onnx_res.message}", file=sys.stderr)
+            return 2
+
+        trt_res = export_tensorrt_from_onnx(
+            onnx_path=onnx_res.output_path,
+            engine_path=engine_out,
+            height=int(args.height),
+            width=int(args.width),
+            fp16=bool(args.fp16),
+            workspace_mb=int(args.workspace_mb),
+        )
+        if not trt_res.ok:
+            print(f"Error: {trt_res.message}", file=sys.stderr)
+            return 2
+        print(trt_res.message)
+        return 0
+
     print("Unknown command", file=sys.stderr)
     return 2
-

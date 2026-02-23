@@ -48,6 +48,10 @@ def create_dataset(
         Path("coco") / "train",
         Path("coco") / "valid",
         Path("coco") / "test",
+        Path("labels_inbox"),
+        Path("labels_inbox") / "yolo",
+        Path("labels_inbox") / "coco",
+        Path("labels_inbox") / "quarantine",
         Path("staging") / "to_label",
         Path("staging") / "labeled",
         Path("staging") / "quarantine",
@@ -82,6 +86,8 @@ def create_dataset(
                 "1) Put images in `raw/` and labels in `yolo/` (optional)\n"
                 "2) Convert to COCO with the CLI (yolo->coco)\n"
                 "3) Train with the CLI (train)\n"
+                "\n"
+                "Optional: drop mixed label exports into `labels_inbox/` and run the CLI ingest command.\n"
             )
             readme_path.write_text(txt, encoding="utf-8")
 
@@ -206,14 +212,18 @@ def yolo_to_coco(
     exts: List[str],
     validate: bool = False,
     validate_only: bool = False,
+    out_dir: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
+    yolo_dir: Optional[Path] = None,
+    labeled_only: bool = False,
 ) -> None:
     import random
     import shutil
 
     dataset_dir = dataset_dir.expanduser().resolve()
-    raw_dir = dataset_dir / "raw"
-    yolo_dir = dataset_dir / "yolo"
-    coco_dir = dataset_dir / "coco"
+    raw_dir = raw_dir.expanduser().resolve() if raw_dir else (dataset_dir / "raw")
+    yolo_dir = yolo_dir.expanduser().resolve() if yolo_dir else (dataset_dir / "yolo")
+    coco_dir = out_dir.expanduser().resolve() if out_dir else (dataset_dir / "coco")
 
     if not raw_dir.exists():
         raise FileNotFoundError(f"raw/ directory not found at {raw_dir}")
@@ -233,6 +243,21 @@ def yolo_to_coco(
 
     basename_to_path = {p.stem: p for p in imgs}
     image_stems = list(basename_to_path.keys())
+
+    if labeled_only:
+        if not yolo_dir.exists():
+            raise RuntimeError(f"labeled_only=True but yolo label dir not found: {yolo_dir}")
+        label_stems = set()
+        for p in yolo_dir.glob("*.txt"):
+            try:
+                if p.stat().st_size > 0:
+                    label_stems.add(p.stem)
+            except Exception:
+                continue
+        image_stems = [s for s in image_stems if s in label_stems]
+        if not image_stems:
+            raise RuntimeError(f"No labeled images found (no matching non-empty *.txt in {yolo_dir})")
+
     random.Random(seed).shuffle(image_stems)
     cut = int(len(image_stems) * train_ratio)
     train_stems = set(image_stems[:cut])
@@ -386,8 +411,9 @@ def yolo_to_coco(
     )
 
     if copy_images:
-        for img in imgs:
-            dst = train_out_dir / img.name if img.stem in train_stems else valid_out_dir / img.name
+        for stem in image_stems:
+            img = basename_to_path[stem]
+            dst = train_out_dir / img.name if stem in train_stems else valid_out_dir / img.name
             if not dst.exists():
                 shutil.copy2(img, dst)
 

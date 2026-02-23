@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Any
+from typing import Optional, Any, Dict, List, Tuple
 
 import os
 
@@ -11,6 +11,9 @@ class LoadResult:
     ok: bool
     replacement_model: Optional[object] = None
     message: str = ""
+    missing_keys: Tuple[str, ...] = ()
+    unexpected_keys: Tuple[str, ...] = ()
+    mismatched_shapes: Tuple[Tuple[str, str, str], ...] = ()  # (key, expected, got)
 
 
 def _torch_load(path: str, map_location: Any, *, verbose: bool) -> object:
@@ -94,6 +97,7 @@ def load_checkpoint_weights(
     *,
     checkpoint_key: Optional[str] = None,
     allow_replace_model: bool = False,
+    strict: bool = False,
     verbose: bool = False,
 ) -> LoadResult:
     if not path:
@@ -115,12 +119,26 @@ def load_checkpoint_weights(
                 if isinstance(maybe, nn.Module):
                     if verbose:
                         print(f"Using checkpoint['{candidate}'] as replacement model ({type(maybe)}).")
+                    if strict:
+                        return LoadResult(
+                            False,
+                            None,
+                            "strict=True disallows replacement model loading (pickled model objects are not deployment-friendly). "
+                            "Re-run without --strict if you trust this checkpoint.",
+                        )
                     return LoadResult(True, maybe, f"replacement:{candidate}")
             except Exception:
                 pass
             if hasattr(maybe, "state_dict") and callable(getattr(maybe, "state_dict")):
                 if verbose:
                     print(f"Using checkpoint['{candidate}'] as replacement model ({type(maybe)}).")
+                if strict:
+                    return LoadResult(
+                        False,
+                        None,
+                        "strict=True disallows replacement model loading (pickled model objects are not deployment-friendly). "
+                        "Re-run without --strict if you trust this checkpoint.",
+                    )
                 return LoadResult(True, maybe, f"replacement:{candidate}")
 
     state = _find_state_dict(ckpt, checkpoint_key)
@@ -128,6 +146,8 @@ def load_checkpoint_weights(
         # last resort: let wrapper handle it
         if hasattr(model, "load") and callable(getattr(model, "load")):
             try:
+                if strict:
+                    return LoadResult(False, None, "strict=True requires a state_dict; wrapper .load(path) is not allowed")
                 model.load(path)  # type: ignore[attr-defined]
                 return LoadResult(True, None, "loaded_via_wrapper_load()")
             except Exception as e:
@@ -147,32 +167,107 @@ def load_checkpoint_weights(
     if target is None:
         return LoadResult(False, None, "Model does not support load_state_dict")
 
-    # filter by matching shapes (avoid hard crashes on mismatched heads/architectures)
+    # Prepare a compatibility report.
     try:
         target_state = target.state_dict()  # type: ignore[attr-defined]
-        filtered = {}
-        skipped = 0
+
+        missing: List[str] = []
+        unexpected: List[str] = []
+        mismatched: List[Tuple[str, str, str]] = []
+
+        # missing keys (expected by model, absent in checkpoint)
+        for k in target_state.keys():
+            if k not in state:
+                missing.append(str(k))
+
+        # unexpected keys and mismatched shapes
         for k, v in state.items():
             if k not in target_state:
-                skipped += 1
+                unexpected.append(str(k))
                 continue
             try:
-                if getattr(v, "shape", None) == getattr(target_state[k], "shape", None):
-                    filtered[k] = v
-                else:
-                    skipped += 1
+                exp = getattr(target_state[k], "shape", None)
+                got = getattr(v, "shape", None)
+                if exp is not None and got is not None and tuple(exp) != tuple(got):
+                    mismatched.append((str(k), str(tuple(exp)), str(tuple(got))))
             except Exception:
-                skipped += 1
+                # if shape inspection fails, treat as mismatch in strict mode
+                mismatched.append((str(k), "unknown", "unknown"))
 
-        if verbose:
-            print(f"Loading {len(filtered)} matched tensors from checkpoint; skipping {skipped} mismatched tensors")
-        target.load_state_dict(filtered, strict=False)  # type: ignore[attr-defined]
+        if strict:
+            if missing or unexpected or mismatched:
+                # Fail fast for deployment: partial loads are a foot-gun.
+                parts: List[str] = ["Strict checkpoint load failed:"]
+                if missing:
+                    parts.append(f"- missing keys: {len(missing)}")
+                if unexpected:
+                    parts.append(f"- unexpected keys: {len(unexpected)}")
+                if mismatched:
+                    parts.append(f"- mismatched shapes: {len(mismatched)}")
+                # show a small sample so the user can diagnose quickly
+                if missing:
+                    parts.append(f"- missing sample: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}")
+                if unexpected:
+                    parts.append(
+                        f"- unexpected sample: {', '.join(unexpected[:10])}{' ...' if len(unexpected) > 10 else ''}"
+                    )
+                if mismatched:
+                    sm = mismatched[:10]
+                    parts.append(
+                        "- mismatched sample: "
+                        + ", ".join([f"{k} exp={e} got={g}" for (k, e, g) in sm])
+                        + (" ..." if len(mismatched) > 10 else "")
+                    )
+                return LoadResult(
+                    False,
+                    None,
+                    "\n".join(parts),
+                    missing_keys=tuple(missing),
+                    unexpected_keys=tuple(unexpected),
+                    mismatched_shapes=tuple(mismatched),
+                )
+
+            if verbose:
+                print("Strict load: checkpoint and model state_dicts match. Loading with strict=True.")
+            target.load_state_dict(state, strict=True)  # type: ignore[attr-defined]
+        else:
+            # filter by matching shapes (avoid hard crashes on mismatched heads/architectures)
+            filtered: Dict[str, object] = {}
+            skipped = 0
+            for k, v in state.items():
+                if k not in target_state:
+                    skipped += 1
+                    continue
+                try:
+                    if getattr(v, "shape", None) == getattr(target_state[k], "shape", None):
+                        filtered[k] = v
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+
+            if verbose:
+                print(f"Loading {len(filtered)} matched tensors from checkpoint; skipping {skipped} mismatched tensors")
+                if mismatched:
+                    sm = mismatched[:10]
+                    print(
+                        "Mismatched shapes sample:",
+                        ", ".join([f"{k} exp={e} got={g}" for (k, e, g) in sm]) + (" ..." if len(mismatched) > 10 else ""),
+                    )
+            target.load_state_dict(filtered, strict=False)  # type: ignore[attr-defined]
         try:
             if hasattr(target, "to") and callable(getattr(target, "to")):
                 target.to(device)  # type: ignore[attr-defined]
         except Exception:
             pass
-        return LoadResult(True, None, f"loaded_filtered_tensors:{len(filtered)}")
+        msg = "loaded_strict_state_dict" if strict else f"loaded_filtered_tensors:{len(filtered)}"
+        return LoadResult(
+            True,
+            None,
+            msg,
+            missing_keys=tuple(missing),
+            unexpected_keys=tuple(unexpected),
+            mismatched_shapes=tuple(mismatched),
+        )
     except Exception as e:
         return LoadResult(False, None, f"load_state_dict failed: {e}")
-

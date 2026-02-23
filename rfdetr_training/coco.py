@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import json
+from datetime import datetime
+import shutil
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,23 @@ def _segmentation_is_nonempty(seg: object) -> bool:
                 return True
         return False
     # RLE dict, treat as present if non-empty dict
+    if isinstance(seg, dict):
+        return bool(seg)
+    return False
+
+
+def _segmentation_is_valid(seg: object) -> bool:
+    # polygons
+    if isinstance(seg, list):
+        if len(seg) == 0:
+            return False
+        for poly in seg:
+            if not isinstance(poly, list):
+                return False
+            if len(poly) < 6 or (len(poly) % 2) != 0:
+                return False
+        return True
+    # RLE dict
     if isinstance(seg, dict):
         return bool(seg)
     return False
@@ -57,12 +76,63 @@ def validate_coco_split(
         errors.append(f"Invalid COCO structure in {ann_path} (images/annotations/categories must be lists)")
         return CocoValidation(False, errors, warnings)
 
+    # category id sanity (common RF-DETR issue: 1-indexed COCO or holes)
+    cat_ids: Set[int] = set()
+    cat_names: List[str] = []
+    for c in cats:
+        try:
+            cat_ids.add(int(c.get("id")))
+            cat_names.append(str(c.get("name", "")).strip())
+        except Exception:
+            errors.append(f"{ann_path}: category missing int id: {c}")
+
+    if cat_ids:
+        min_id = min(cat_ids)
+        max_id = max(cat_ids)
+        # RF-DETR expects COCO-style ids, but training has had bugs with 1-indexed datasets.
+        if min_id == 1:
+            warnings.append(
+                f"{ann_path}: categories are 1-indexed (min id=1). "
+                "RF-DETR has had training issues with 1-indexed COCO. Prefer normalizing to 0..N-1."
+            )
+        elif min_id != 0:
+            warnings.append(f"{ann_path}: categories min id is {min_id} (expected 0 for smoothest training).")
+
+        expected = set(range(min_id, max_id + 1))
+        holes = sorted(expected.difference(cat_ids))
+        if holes:
+            warnings.append(
+                f"{ann_path}: category ids have holes (missing ids like {holes[:10]}{'...' if len(holes)>10 else ''}). "
+                "This can cause num_classes mismatches. Prefer normalizing to 0..N-1."
+            )
+
+        # duplicate category names can lead to wrong num_classes/class_names in some RF-DETR versions
+        name_counts = {}
+        for n in cat_names:
+            if not n:
+                continue
+            name_counts[n] = name_counts.get(n, 0) + 1
+        dups = [n for n, ct in name_counts.items() if ct > 1]
+        if dups:
+            warnings.append(
+                f"{ann_path}: duplicate category names found ({dups[:10]}{'...' if len(dups)>10 else ''}). "
+                "This can cause duplicated class_names / wrong num_classes. Prefer aligning categories to METADATA.json."
+            )
+
     if len(images) == 0:
         warnings.append(f"{ann_path} has 0 images")
     if len(anns) == 0:
         warnings.append(f"{ann_path} has 0 annotations")
     if len(cats) == 0:
         warnings.append(f"{ann_path} has 0 categories")
+    else:
+        # Some RF-DETR versions assume every category has a 'supercategory' field.
+        missing_sc = 0
+        for c in cats:
+            if isinstance(c, dict) and "supercategory" not in c:
+                missing_sc += 1
+        if missing_sc:
+            warnings.append(f"{ann_path}: {missing_sc} categories are missing 'supercategory' (will crash some RF-DETR versions)")
 
     image_ids: Set[int] = set()
     file_names: Set[str] = set()
@@ -81,14 +151,8 @@ def validate_coco_split(
             if check_images_exist and not (split_dir / fn).exists():
                 warnings.append(f"{ann_path}: missing image file on disk: {split_dir / fn}")
 
-    cat_ids: Set[int] = set()
-    for c in cats:
-        try:
-            cat_ids.add(int(c.get("id")))
-        except Exception:
-            errors.append(f"{ann_path}: category missing int id: {c}")
-
     seg_nonempty_count = 0
+    seg_invalid_count = 0
     for a in anns:
         try:
             iid = int(a.get("image_id"))
@@ -110,9 +174,13 @@ def validate_coco_split(
             seg = a.get("segmentation", None)
             if _segmentation_is_nonempty(seg):
                 seg_nonempty_count += 1
+            if not _segmentation_is_valid(seg):
+                seg_invalid_count += 1
 
     if task == "seg" and len(anns) > 0 and seg_nonempty_count == 0:
-        warnings.append(f"{ann_path}: task=seg but 0 annotations have non-empty segmentation")
+        errors.append(f"{ann_path}: task=seg but 0 annotations have non-empty segmentation (this is a detection-only dataset)")
+    if task == "seg" and seg_invalid_count > 0:
+        errors.append(f"{ann_path}: task=seg but {seg_invalid_count} annotations have invalid/empty segmentation")
 
     return CocoValidation(len(errors) == 0, errors, warnings)
 
@@ -145,3 +213,230 @@ def ensure_minimal_test_split(coco_dir: Path) -> Optional[Path]:
     ann_path.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
     return ann_path
 
+
+def _write_empty_split(ann_path: Path, *, categories: List[Dict[str, Any]]) -> None:
+    ann_path.parent.mkdir(parents=True, exist_ok=True)
+    minimal = {
+        "info": {"description": "empty split", "version": "1.0"},
+        "licenses": [],
+        "images": [],
+        "annotations": [],
+        "categories": categories,
+    }
+    ann_path.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
+
+
+def reset_coco_dir(dataset_dir: Path, *, backup: bool = True) -> Tuple[bool, str]:
+    """Reset `<dataset>/coco` to empty train/valid/test splits (with categories from METADATA.json if present).
+
+    This is useful when you ingested with the wrong label type (e.g. YOLO polygons but used detect),
+    or when you want to start fresh without creating a new UUID.
+    """
+    dataset_dir = dataset_dir.expanduser().resolve()
+    coco_dir = dataset_dir / "coco"
+    md_path = dataset_dir / "METADATA.json"
+
+    class_names: List[str] = []
+    if md_path.exists():
+        try:
+            md = _load_json(md_path)
+            class_names = list(md.get("class_names", []) or [])
+        except Exception:
+            class_names = []
+
+    categories = [{"id": i, "name": n, "supercategory": ""} for i, n in enumerate(class_names)] if class_names else []
+
+    if coco_dir.exists() and backup:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak = dataset_dir / f"coco_backup_{ts}"
+        shutil.move(str(coco_dir), str(bak))
+    else:
+        coco_dir.mkdir(parents=True, exist_ok=True)
+
+    for sp in ("train", "valid", "test"):
+        _write_empty_split(coco_dir / sp / "_annotations.coco.json", categories=categories)
+    return True, f"Reset COCO splits at {coco_dir} (backup={'yes' if backup else 'no'})"
+
+
+def normalize_coco_category_ids(ann_path: Path, *, dry_run: bool = False) -> Tuple[bool, str]:
+    """Rewrite categories/annotations to use contiguous 0..N-1 category ids (in ascending old-id order).
+
+    Creates a `.bak` file next to the JSON (unless dry_run=True).
+    """
+    if not ann_path.exists():
+        return False, f"Not found: {ann_path}"
+
+    coco = _load_json(ann_path)
+    cats = coco.get("categories", []) or []
+    anns = coco.get("annotations", []) or []
+    if not isinstance(cats, list) or not isinstance(anns, list):
+        return False, f"Invalid COCO structure in {ann_path} (categories/annotations must be lists)"
+
+    old_ids: List[int] = []
+    id_to_cat: Dict[int, Dict[str, Any]] = {}
+    for c in cats:
+        try:
+            cid = int(c.get("id"))
+        except Exception:
+            continue
+        if cid not in id_to_cat:
+            id_to_cat[cid] = c
+            old_ids.append(cid)
+
+    if not old_ids:
+        return False, f"No categories found in {ann_path}"
+
+    old_ids_sorted = sorted(old_ids)
+    mapping = {old: new for new, old in enumerate(old_ids_sorted)}
+
+    # If already normalized, do nothing
+    if old_ids_sorted == list(range(0, len(old_ids_sorted))):
+        return True, f"Already normalized: {ann_path}"
+
+    new_cats: List[Dict[str, Any]] = []
+    for old in old_ids_sorted:
+        c = dict(id_to_cat[old])
+        c["id"] = mapping[old]
+        new_cats.append(c)
+
+    new_anns: List[Dict[str, Any]] = []
+    for a in anns:
+        try:
+            old = int(a.get("category_id"))
+        except Exception:
+            new_anns.append(a)
+            continue
+        if old in mapping:
+            aa = dict(a)
+            aa["category_id"] = mapping[old]
+            new_anns.append(aa)
+        else:
+            new_anns.append(a)
+
+    coco["categories"] = new_cats
+    coco["annotations"] = new_anns
+
+    if dry_run:
+        return True, f"Would normalize ids in: {ann_path}"
+
+    bak = ann_path.with_suffix(ann_path.suffix + ".bak")
+    if not bak.exists():
+        bak.write_text(json.dumps(_load_json(ann_path), indent=2), encoding="utf-8")
+
+    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    return True, f"Normalized category ids in: {ann_path}"
+
+
+def patch_coco_categories_supercategory(ann_path: Path, *, default: str = "") -> Tuple[bool, str]:
+    """Ensure every categories[] entry has a 'supercategory' key (RF-DETR may assume it exists).
+
+    Writes a `.bak` file next to the JSON if changes are made.
+    Returns (changed, message).
+    """
+    if not ann_path.exists():
+        return False, f"Not found: {ann_path}"
+
+    try:
+        coco = _load_json(ann_path)
+    except Exception as e:
+        return False, f"Failed to parse {ann_path}: {e}"
+
+    cats = coco.get("categories", None)
+    if not isinstance(cats, list):
+        return False, f"{ann_path}: categories is not a list"
+
+    changed = False
+    new_cats: List[Dict[str, Any]] = []
+    for c in cats:
+        if not isinstance(c, dict):
+            new_cats.append({"id": c, "name": str(c), "supercategory": default})
+            changed = True
+            continue
+        cc = dict(c)
+        if "supercategory" not in cc:
+            cc["supercategory"] = default
+            changed = True
+        new_cats.append(cc)
+
+    if not changed:
+        return False, f"OK: {ann_path}"
+
+    bak = ann_path.with_suffix(ann_path.suffix + ".bak")
+    if not bak.exists():
+        bak.write_text(json.dumps(_load_json(ann_path), indent=2), encoding="utf-8")
+
+    coco["categories"] = new_cats
+    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    return True, f"Patched categories.supercategory in: {ann_path}"
+
+
+def align_coco_categories_to_metadata(ann_path: Path, *, class_names: List[str], dry_run: bool = False) -> Tuple[bool, str]:
+    """Force categories[] to match METADATA.json class_names and remap annotation category_id by category name.
+
+    This prevents duplicated class names (and wrong num_classes) when merging COCO sources.
+    """
+    if not ann_path.exists():
+        return False, f"Not found: {ann_path}"
+    if not class_names:
+        return False, "No class_names provided"
+
+    try:
+        coco = _load_json(ann_path)
+    except Exception as e:
+        return False, f"Failed to parse {ann_path}: {e}"
+
+    cats = coco.get("categories", []) or []
+    anns = coco.get("annotations", []) or []
+    if not isinstance(cats, list) or not isinstance(anns, list):
+        return False, f"Invalid COCO structure in {ann_path}"
+
+    # old category_id -> category_name
+    old_id_to_name: Dict[int, str] = {}
+    for c in cats:
+        if not isinstance(c, dict):
+            continue
+        try:
+            cid = int(c.get("id"))
+        except Exception:
+            continue
+        name = str(c.get("name", "")).strip()
+        if name:
+            old_id_to_name[cid] = name
+
+    name_to_new = {str(n): i for i, n in enumerate(class_names)}
+
+    remapped = 0
+    unknown = 0
+    for a in anns:
+        try:
+            old = int(a.get("category_id"))
+        except Exception:
+            continue
+        name = old_id_to_name.get(old, "")
+        if not name:
+            unknown += 1
+            continue
+        if name not in name_to_new:
+            unknown += 1
+            continue
+        new = int(name_to_new[name])
+        if new != old:
+            if not dry_run:
+                a["category_id"] = new
+            remapped += 1
+
+    if unknown:
+        return False, f"{ann_path}: found {unknown} annotations with category ids/names not in METADATA.json class_names"
+
+    new_categories = [{"id": i, "name": n, "supercategory": ""} for i, n in enumerate(class_names)]
+    if dry_run:
+        return True, f"Would align categories to METADATA.json for: {ann_path} (remapped {remapped} annotations)"
+
+    bak = ann_path.with_suffix(ann_path.suffix + ".bak")
+    if not bak.exists():
+        bak.write_text(json.dumps(_load_json(ann_path), indent=2), encoding="utf-8")
+
+    coco["categories"] = new_categories
+    coco["annotations"] = anns
+    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    return True, f"Aligned categories to METADATA.json for: {ann_path} (remapped {remapped} annotations)"

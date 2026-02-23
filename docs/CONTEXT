@@ -24,6 +24,7 @@ Suggested UUID folder layout (recommended):
 - `logs/` : TensorBoard logs, W&B metadata, training notes
 - `exports/` : ONNX, TorchScript, optimized artifacts for inference
 - `README.md` or `METADATA.json` : small manifest describing the dataset (class names, original source, license, notes)
+- `labels_inbox/` : optional “drop folder” for mixed label formats (YOLO + COCO) before ingestion
 
 Why COCO? (RF-DETR requirement)
 - RF-DETR expects the dataset to be in COCO JSON format and split into `train`, `valid`, and `test` directories. Each split must include a `_annotations.coco.json` file plus the images for that split.
@@ -65,6 +66,15 @@ Notes on the helper:
 - The script reads `METADATA.json` `class_names` to assign category names. If `class_names` is empty, numeric YOLO ids are used as category ids and category names are left empty.
 - `--validate` prints a report then continues with conversion; `--validate-only` prints the report and exits without writing files.
 - The helper expects YOLO label files named like `img_0001.txt` with the same stem as the image `img_0001.jpg` present in `raw/`.
+- For smooth RF-DETR training, prefer COCO `categories[].id` values that are contiguous and 0-indexed (0..N-1). If you have 1-indexed COCO, normalize it.
+
+Mixed label formats (YOLO + COCO):
+- Prefer a single source-of-truth for training: COCO under `coco/<split>/`.
+- If you have some labels already in COCO and others in YOLO, convert YOLO → COCO and then merge COCO files into the target split.
+- Use:
+  - `python -m rfdetr_training dataset import-coco ...` to merge an external COCO JSON (and images) into `coco/train|valid|test`
+  - `python -m rfdetr_training dataset yolo-to-coco --out-dir ...` to write a temporary COCO export without overwriting your dataset splits
+  - `python -m rfdetr_training dataset ingest ...` to ingest everything from `labels_inbox/` using a train/valid ratio, `METADATA.json` class mapping, and a quarantine for conflicts
 
 Installation & environment (minimum):
 - Python >= 3.9

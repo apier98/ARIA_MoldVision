@@ -23,7 +23,6 @@ They are intentionally not part of the “supported” training interface to kee
 - `scripts/visualize_annotations.py`: Visualize COCO annotations by sampling images.
 - `scripts/commit_from_staging.py`: Merge staged labeled COCO JSON(s) into `coco/<split>`.
 - `scripts/remove_coco_class.py`: Remove one or more `category_id` values across splits.
-- `scripts/remap_coco_ids.py`: Remap category ids (be careful; can break label mappings).
+- `scripts/remap_coco_ids.py`: Deprecated wrapper. Prefer `python -m rfdetr_training dataset normalize-coco-ids ...`.
 - `scripts/compute_detection_stats.py`: Quick per-class stats by IoU matching.
 - `scripts/expand_checkpoint_head.py`: Experimental head expansion helper (finetune after).
-

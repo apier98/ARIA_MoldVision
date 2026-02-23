@@ -9,3 +9,6 @@ opencv-python
 supervision
 numpy
 
+# Optional (export)
+onnx
+onnxruntime
