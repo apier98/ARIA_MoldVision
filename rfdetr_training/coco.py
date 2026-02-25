@@ -16,6 +16,15 @@ class CocoValidation:
     warnings: List[str]
 
 
+@dataclass(frozen=True)
+class CocoPruneResult:
+    ok: bool
+    removed_images: int = 0
+    removed_annotations: int = 0
+    backup_path: Optional[Path] = None
+    message: str = ""
+
+
 def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -29,7 +38,25 @@ def _segmentation_is_nonempty(seg: object) -> bool:
         return False
     # RLE dict, treat as present if non-empty dict
     if isinstance(seg, dict):
-        return bool(seg)
+        counts = seg.get("counts")
+        size = seg.get("size")
+        if counts is None or size is None:
+            return False
+        if isinstance(size, (list, tuple)) and len(size) == 2:
+            try:
+                h = int(size[0])
+                w = int(size[1])
+                if h <= 0 or w <= 0:
+                    return False
+            except Exception:
+                return False
+        else:
+            return False
+        if isinstance(counts, str):
+            return len(counts) > 0
+        if isinstance(counts, (list, tuple, bytes, bytearray)):
+            return len(counts) > 0
+        return False
     return False
 
 
@@ -46,7 +73,26 @@ def _segmentation_is_valid(seg: object) -> bool:
         return True
     # RLE dict
     if isinstance(seg, dict):
-        return bool(seg)
+        counts = seg.get("counts")
+        size = seg.get("size")
+        if counts is None or size is None:
+            return False
+        if isinstance(size, (list, tuple)) and len(size) == 2:
+            try:
+                h = int(size[0])
+                w = int(size[1])
+            except Exception:
+                return False
+            if h <= 0 or w <= 0:
+                return False
+        else:
+            return False
+        # pycocotools allows counts to be a compact string or a list.
+        if isinstance(counts, str):
+            return len(counts) > 0
+        if isinstance(counts, (list, tuple, bytes, bytearray)):
+            return len(counts) > 0
+        return False
     return False
 
 
@@ -135,6 +181,7 @@ def validate_coco_split(
             warnings.append(f"{ann_path}: {missing_sc} categories are missing 'supercategory' (will crash some RF-DETR versions)")
 
     image_ids: Set[int] = set()
+    image_id_to_name: Dict[int, str] = {}
     file_names: Set[str] = set()
     for im in images:
         try:
@@ -148,11 +195,13 @@ def validate_coco_split(
             errors.append(f"{ann_path}: image id={iid} missing file_name")
         else:
             file_names.add(fn)
+            image_id_to_name[iid] = fn
             if check_images_exist and not (split_dir / fn).exists():
                 warnings.append(f"{ann_path}: missing image file on disk: {split_dir / fn}")
 
     seg_nonempty_count = 0
     seg_invalid_count = 0
+    seg_valid_mask_anns_by_image: Dict[int, int] = {}
     for a in anns:
         try:
             iid = int(a.get("image_id"))
@@ -174,8 +223,27 @@ def validate_coco_split(
             seg = a.get("segmentation", None)
             if _segmentation_is_nonempty(seg):
                 seg_nonempty_count += 1
-            if not _segmentation_is_valid(seg):
+            if _segmentation_is_valid(seg):
+                seg_valid_mask_anns_by_image[iid] = seg_valid_mask_anns_by_image.get(iid, 0) + 1
+            else:
                 seg_invalid_count += 1
+
+    if task == "seg":
+        # RF-DETR's seg training pipeline (via Albumentations) can crash if an image yields an empty masks list.
+        # Background images (0 annotations) are fine for detection, but typically not for seg.
+        empty_mask_images: List[str] = []
+        for iid in image_ids:
+            if seg_valid_mask_anns_by_image.get(iid, 0) <= 0:
+                name = image_id_to_name.get(iid, f"id={iid}")
+                empty_mask_images.append(str(name))
+
+        if empty_mask_images:
+            preview = ", ".join(empty_mask_images[:10]) + ("..." if len(empty_mask_images) > 10 else "")
+            errors.append(
+                f"{ann_path}: task=seg but {len(empty_mask_images)} images have 0 valid masks "
+                f"(example: {preview}). This will crash training with 'masks cannot be empty'. "
+                "Remove background images for seg or run `python -m rfdetr_training dataset prune-empty-masks -d <DATASET_DIR> --split train|valid`."
+            )
 
     if task == "seg" and len(anns) > 0 and seg_nonempty_count == 0:
         errors.append(f"{ann_path}: task=seg but 0 annotations have non-empty segmentation (this is a detection-only dataset)")
@@ -183,6 +251,267 @@ def validate_coco_split(
         errors.append(f"{ann_path}: task=seg but {seg_invalid_count} annotations have invalid/empty segmentation")
 
     return CocoValidation(len(errors) == 0, errors, warnings)
+
+
+def prune_empty_masks_in_split(split_dir: Path, *, dry_run: bool = False) -> CocoPruneResult:
+    """For COCO segmentation, drop annotations with invalid/empty segmentation and drop images that end up with 0 masks.
+
+    This does not delete any image files from disk; it only rewrites `_annotations.coco.json`.
+    """
+    ann_path = split_dir / "_annotations.coco.json"
+    if not ann_path.exists():
+        return CocoPruneResult(False, message=f"Missing: {ann_path}")
+
+    try:
+        coco = _load_json(ann_path)
+    except Exception as e:
+        return CocoPruneResult(False, message=f"Failed to parse {ann_path}: {e}")
+
+    images = coco.get("images", []) or []
+    anns = coco.get("annotations", []) or []
+    if not isinstance(images, list) or not isinstance(anns, list):
+        return CocoPruneResult(False, message=f"Invalid COCO structure in {ann_path} (images/annotations must be lists)")
+
+    kept_anns: List[Dict[str, Any]] = []
+    mask_ann_count: Dict[int, int] = {}
+    removed_annotations = 0
+    for a in anns:
+        if not isinstance(a, dict):
+            removed_annotations += 1
+            continue
+        seg = a.get("segmentation", None)
+        if not _segmentation_is_valid(seg):
+            removed_annotations += 1
+            continue
+        kept_anns.append(a)
+        try:
+            iid = int(a.get("image_id"))
+            mask_ann_count[iid] = mask_ann_count.get(iid, 0) + 1
+        except Exception:
+            # keep it; validator can catch weird ids later
+            pass
+
+    kept_images: List[Dict[str, Any]] = []
+    kept_image_ids: Set[int] = set()
+    removed_images = 0
+    for im in images:
+        if not isinstance(im, dict):
+            removed_images += 1
+            continue
+        try:
+            iid = int(im.get("id"))
+        except Exception:
+            removed_images += 1
+            continue
+        if mask_ann_count.get(iid, 0) <= 0:
+            removed_images += 1
+            continue
+        kept_images.append(im)
+        kept_image_ids.add(iid)
+
+    # Drop any annotations that reference images we dropped.
+    kept_anns2: List[Dict[str, Any]] = []
+    for a in kept_anns:
+        try:
+            iid = int(a.get("image_id"))
+        except Exception:
+            removed_annotations += 1
+            continue
+        if iid not in kept_image_ids:
+            removed_annotations += 1
+            continue
+        kept_anns2.append(a)
+
+    if dry_run:
+        return CocoPruneResult(
+            True,
+            removed_images=int(removed_images),
+            removed_annotations=int(removed_annotations),
+            backup_path=None,
+            message=f"{split_dir.name}: would remove {removed_images} images and {removed_annotations} annotations (dry-run)",
+        )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = ann_path.with_name(f"_annotations.coco.backup_{ts}.json")
+    try:
+        shutil.copy2(str(ann_path), str(backup_path))
+    except Exception:
+        backup_path = None
+
+    coco["images"] = kept_images
+    coco["annotations"] = kept_anns2
+    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+
+    return CocoPruneResult(
+        True,
+        removed_images=int(removed_images),
+        removed_annotations=int(removed_annotations),
+        backup_path=backup_path,
+        message=f"{split_dir.name}: removed {removed_images} images and {removed_annotations} annotations",
+    )
+
+
+def _poly_area(poly: List[float]) -> float:
+    # Shoelace formula. poly = [x1,y1,x2,y2,...]
+    if len(poly) < 6 or (len(poly) % 2) != 0:
+        return 0.0
+    xs = poly[0::2]
+    ys = poly[1::2]
+    n = len(xs)
+    acc = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        acc += float(xs[i]) * float(ys[j]) - float(xs[j]) * float(ys[i])
+    return abs(acc) * 0.5
+
+
+def prune_too_small_masks_in_split(
+    split_dir: Path,
+    *,
+    resolution: int,
+    min_scaled_area: float = 1.0,
+    dry_run: bool = False,
+) -> CocoPruneResult:
+    """Drop seg annotations likely to vanish at a given square-resize resolution.
+
+    RF-DETR's seg dataloader can crash with `masks cannot be empty` if, after resizing, an image ends up with 0 masks.
+    This utility removes tiny instances (by scaled area heuristic) and then removes images with 0 remaining masks.
+    """
+    if resolution <= 0:
+        return CocoPruneResult(False, message="resolution must be > 0")
+
+    ann_path = split_dir / "_annotations.coco.json"
+    if not ann_path.exists():
+        return CocoPruneResult(False, message=f"Missing: {ann_path}")
+
+    try:
+        coco = _load_json(ann_path)
+    except Exception as e:
+        return CocoPruneResult(False, message=f"Failed to parse {ann_path}: {e}")
+
+    images = coco.get("images", []) or []
+    anns = coco.get("annotations", []) or []
+    if not isinstance(images, list) or not isinstance(anns, list):
+        return CocoPruneResult(False, message=f"Invalid COCO structure in {ann_path} (images/annotations must be lists)")
+
+    id_to_hw: Dict[int, Tuple[int, int]] = {}
+    for im in images:
+        if not isinstance(im, dict):
+            continue
+        try:
+            iid = int(im.get("id"))
+            w = int(im.get("width") or 0)
+            h = int(im.get("height") or 0)
+        except Exception:
+            continue
+        if w > 0 and h > 0:
+            id_to_hw[iid] = (w, h)
+
+    kept_anns: List[Dict[str, Any]] = []
+    removed_annotations = 0
+    kept_mask_count: Dict[int, int] = {}
+    for a in anns:
+        if not isinstance(a, dict):
+            removed_annotations += 1
+            continue
+        seg = a.get("segmentation", None)
+        if not _segmentation_is_valid(seg):
+            removed_annotations += 1
+            continue
+        try:
+            iid = int(a.get("image_id"))
+        except Exception:
+            removed_annotations += 1
+            continue
+
+        hw = id_to_hw.get(iid)
+        if hw is None:
+            # Can't scale; keep to avoid accidental data loss.
+            kept_anns.append(a)
+            kept_mask_count[iid] = kept_mask_count.get(iid, 0) + 1
+            continue
+        w, h = hw
+        scale = float(resolution) / float(max(w, h))
+
+        area = a.get("area", None)
+        area_f = None
+        if isinstance(area, (int, float)) and float(area) > 0:
+            area_f = float(area)
+        elif isinstance(seg, list):
+            area_f = float(sum(_poly_area(poly) for poly in seg if isinstance(poly, list)))
+
+        if area_f is not None:
+            scaled = area_f * (scale * scale)
+            if scaled < float(min_scaled_area):
+                removed_annotations += 1
+                continue
+
+        kept_anns.append(a)
+        kept_mask_count[iid] = kept_mask_count.get(iid, 0) + 1
+
+    kept_images: List[Dict[str, Any]] = []
+    kept_image_ids: Set[int] = set()
+    removed_images = 0
+    for im in images:
+        if not isinstance(im, dict):
+            removed_images += 1
+            continue
+        try:
+            iid = int(im.get("id"))
+        except Exception:
+            removed_images += 1
+            continue
+        if kept_mask_count.get(iid, 0) <= 0:
+            removed_images += 1
+            continue
+        kept_images.append(im)
+        kept_image_ids.add(iid)
+
+    kept_anns2: List[Dict[str, Any]] = []
+    for a in kept_anns:
+        try:
+            iid = int(a.get("image_id"))
+        except Exception:
+            removed_annotations += 1
+            continue
+        if iid not in kept_image_ids:
+            removed_annotations += 1
+            continue
+        kept_anns2.append(a)
+
+    if dry_run:
+        return CocoPruneResult(
+            True,
+            removed_images=int(removed_images),
+            removed_annotations=int(removed_annotations),
+            backup_path=None,
+            message=(
+                f"{split_dir.name}: would remove {removed_images} images and {removed_annotations} annotations "
+                f"(resolution={resolution}, min_scaled_area={min_scaled_area}, dry-run)"
+            ),
+        )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = ann_path.with_name(f"_annotations.coco.backup_{ts}.json")
+    try:
+        shutil.copy2(str(ann_path), str(backup_path))
+    except Exception:
+        backup_path = None
+
+    coco["images"] = kept_images
+    coco["annotations"] = kept_anns2
+    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+
+    return CocoPruneResult(
+        True,
+        removed_images=int(removed_images),
+        removed_annotations=int(removed_annotations),
+        backup_path=backup_path,
+        message=(
+            f"{split_dir.name}: removed {removed_images} images and {removed_annotations} annotations "
+            f"(resolution={resolution}, min_scaled_area={min_scaled_area})"
+        ),
+    )
 
 
 def ensure_minimal_test_split(coco_dir: Path) -> Optional[Path]:

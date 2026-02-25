@@ -5,6 +5,7 @@ import sys
 import os
 import subprocess
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -16,13 +17,14 @@ from .coco import (
     validate_coco_split,
 )
 from .datasets import load_metadata
+from .model_factory import instantiate_rfdetr_model
 
 
 @dataclass(frozen=True)
 class TrainConfig:
     dataset_dir: Path  # dataset UUID folder
     task: str  # detect|seg
-    size: str  # nano|small|base|medium (detect only)
+    size: str  # nano|small|base|medium (seg depends on installed rfdetr version)
     epochs: int
     batch_size: int
     grad_accum: int
@@ -47,6 +49,11 @@ class TrainConfig:
     checkpoint_key: Optional[str]
     patch_inference_mode: Optional[bool]
     validate_dataset: bool
+    multi_scale: Optional[bool]
+    expanded_scales: Optional[bool]
+    do_random_resize_via_padding: Optional[bool]
+    aug_config: Optional[Dict[str, Any]]
+    no_aug: bool
 
 
 def _summarize_training_outputs(out_dir: Path) -> None:
@@ -90,6 +97,19 @@ def _try_git_sha(repo_root: Path) -> Optional[str]:
         return s or None
     except Exception:
         return None
+
+
+def _archive_previous_error_trace(out_dir: Path) -> None:
+    """Avoid confusing 'training_error_trace.txt' from a previous failed run with the current run."""
+    try:
+        p = out_dir / "training_error_trace.txt"
+        if not p.exists():
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = out_dir / f"training_error_trace_prev_{ts}.txt"
+        p.rename(dst)
+    except Exception:
+        return
 
 
 def _write_deployment_bundle(out_dir: Path, dataset_dir: Path, cfg: TrainConfig, metadata: Dict[str, Any]) -> None:
@@ -206,41 +226,6 @@ class _PatchedInferenceMode:
         return False
 
 
-def _instantiate_model(task: str, size: str, num_classes: Optional[int], pretrain_weights: Optional[str]):
-    task = (task or "detect").lower().strip()
-    if task == "seg":
-        from rfdetr import RFDETRSegPreview  # type: ignore
-
-        kwargs: Dict[str, Any] = {}
-        if pretrain_weights:
-            kwargs["pretrain_weights"] = pretrain_weights
-        # seg preview may not accept num_classes; keep it best-effort
-        try:
-            if num_classes is not None:
-                kwargs["num_classes"] = num_classes
-            return RFDETRSegPreview(**kwargs) if kwargs else RFDETRSegPreview()
-        except TypeError:
-            return RFDETRSegPreview()
-
-    # detect
-    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium  # type: ignore
-
-    cls = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium}.get(size)
-    if cls is None:
-        raise ValueError(f"Unknown model size: {size}")
-
-    kwargs = {}
-    if pretrain_weights:
-        kwargs["pretrain_weights"] = pretrain_weights
-    if num_classes is not None:
-        kwargs["num_classes"] = int(num_classes)
-    try:
-        return cls(**kwargs) if kwargs else cls()
-    except TypeError:
-        # older constructors may not accept num_classes or pretrain_weights
-        return cls()
-
-
 def train(cfg: TrainConfig) -> int:
     patch_default = os.name == "nt"
     patch_enabled = patch_default if cfg.patch_inference_mode is None else bool(cfg.patch_inference_mode)
@@ -298,6 +283,7 @@ def train(cfg: TrainConfig) -> int:
 
     out_dir = cfg.output_dir.expanduser().resolve() if cfg.output_dir else (dataset_dir / "models")
     out_dir.mkdir(parents=True, exist_ok=True)
+    _archive_previous_error_trace(out_dir)
 
     if cfg.resume and cfg.finetune_from:
         print("Error: --resume and --finetune-from are mutually exclusive.", file=sys.stderr)
@@ -305,7 +291,13 @@ def train(cfg: TrainConfig) -> int:
 
     # instantiate model
     try:
-        model = _instantiate_model(cfg.task, cfg.size, num_classes, cfg.pretrain_weights)
+        model, cls_name, size_applied = instantiate_rfdetr_model(
+            cfg.task, cfg.size, num_classes=num_classes, pretrain_weights=cfg.pretrain_weights
+        )
+        if cfg.task.lower().strip() == "seg" and not size_applied:
+            print(f"Note: --size {cfg.size!r} not applied for segmentation; using {cls_name}.")
+        else:
+            print(f"Note: instantiated model: {cls_name} (task={cfg.task}, size={cfg.size}).")
     except Exception as e:
         print("Failed to instantiate model. Is `rfdetr` installed in this environment?", file=sys.stderr)
         print(str(e), file=sys.stderr)
@@ -387,6 +379,33 @@ def train(cfg: TrainConfig) -> int:
             )
         train_kwargs["resolution"] = res
 
+    if bool(cfg.no_aug):
+        train_kwargs["aug_config"] = {}
+        print("Note: augmentations disabled via --no-aug (aug_config={}).")
+    elif cfg.aug_config is not None:
+        train_kwargs["aug_config"] = cfg.aug_config
+        print("Note: using custom aug_config from CLI.")
+
+    # multi-scale / resize policies
+    if cfg.task.lower().strip() == "seg":
+        # RF-DETR seg can crash with "masks cannot be empty" when multi-scale training crops away all instances.
+        # Default to a stable, deployment-friendly regime unless explicitly overridden.
+        if cfg.multi_scale is None:
+            train_kwargs["multi_scale"] = False
+            train_kwargs["expanded_scales"] = False
+            print("Note: --task seg: defaulting multi_scale=False for stability (pass --multi-scale to enable).")
+        else:
+            train_kwargs["multi_scale"] = bool(cfg.multi_scale)
+            if cfg.expanded_scales is not None:
+                train_kwargs["expanded_scales"] = bool(cfg.expanded_scales)
+    else:
+        if cfg.multi_scale is not None:
+            train_kwargs["multi_scale"] = bool(cfg.multi_scale)
+        if cfg.expanded_scales is not None:
+            train_kwargs["expanded_scales"] = bool(cfg.expanded_scales)
+    if cfg.do_random_resize_via_padding is not None:
+        train_kwargs["do_random_resize_via_padding"] = bool(cfg.do_random_resize_via_padding)
+
     # segmentation defaults / safety
     if cfg.task == "seg":
         nq = cfg.num_queries if cfg.num_queries is not None else 200
@@ -448,10 +467,17 @@ def train(cfg: TrainConfig) -> int:
                 "Hint: Windows multiprocessing issue. Try `--num-workers 0` and run from a terminal (not inside a notebook).",
                 file=sys.stderr,
             )
+        if "masks cannot be empty" in low:
+            print(
+                "Hint: segmentation training crashed because some images have 0 masks (background/empty annotations). "
+                "Fix the dataset (e.g. re-ingest with `--no-include-background` or run "
+                "`python -m rfdetr_training dataset prune-empty-masks -d <DATASET_DIR> --split train` and `--split valid`).",
+                file=sys.stderr,
+            )
         if "out of memory" in low or "cuda out of memory" in low:
             print(
-                "Hint: OOM. Reduce `--batch-size` or `--resolution`, and consider setting "
-                "`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.",
+                "Hint: OOM. Reduce `--batch-size` or `--resolution`. "
+                "Note: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is not supported on all platforms (e.g. Windows).",
                 file=sys.stderr,
             )
         return 10

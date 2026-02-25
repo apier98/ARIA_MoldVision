@@ -179,7 +179,11 @@ def parse_model_output_detr(
 
     logits = out.get("pred_logits")
     boxes = out.get("pred_boxes")
-    masks = out.get("pred_masks") or out.get("masks") or out.get("mask")
+    masks = None
+    for k in ("pred_masks", "masks", "mask"):
+        if k in out:
+            masks = out.get(k)
+            break
 
     if not isinstance(logits, torch.Tensor) or not isinstance(boxes, torch.Tensor):
         return [], [], [], None
@@ -197,12 +201,18 @@ def parse_model_output_detr(
     if logits0.ndim != 2 or boxes0.ndim != 2 or boxes0.shape[-1] != 4:
         return [], [], [], None
 
-    probs = torch.softmax(logits0, dim=-1)
-    # common DETR convention: last class is "no-object"
-    if probs.shape[-1] > 1:
-        probs = probs[..., :-1]
-
-    scores_t, labels_t = probs.max(dim=-1)
+    # Some models use a "no-object" class (softmax over C+1), while others emit
+    # per-class logits without a background (often sigmoid over C).
+    if int(logits0.shape[-1]) == 1:
+        probs = torch.sigmoid(logits0)
+        scores_t = probs[:, 0]
+        labels_t = torch.zeros((scores_t.shape[0],), dtype=torch.int64, device=scores_t.device)
+    else:
+        probs = torch.softmax(logits0, dim=-1)
+        # common DETR convention: last class is "no-object"
+        if probs.shape[-1] > 1:
+            probs = probs[..., :-1]
+        scores_t, labels_t = probs.max(dim=-1)
     keep = scores_t >= float(score_thresh)
     if keep.any():
         idx = torch.nonzero(keep, as_tuple=False).squeeze(1)

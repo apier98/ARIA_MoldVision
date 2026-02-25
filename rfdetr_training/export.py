@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .checkpoints import load_checkpoint_weights
 from .datasets import load_metadata
+from .model_factory import instantiate_rfdetr_model
 
 
 @dataclass(frozen=True)
@@ -19,60 +20,16 @@ class ExportResult:
 
 
 def _instantiate_model(task: str, size: str, num_classes: Optional[int], pretrain_weights: Optional[str] = None):
-    task = (task or "detect").lower().strip()
-    if task == "seg":
-        from rfdetr import RFDETRSegPreview  # type: ignore
-
-        kwargs: Dict[str, Any] = {}
-        if pretrain_weights:
-            kwargs["pretrain_weights"] = pretrain_weights
-        try:
-            if num_classes is not None:
-                kwargs["num_classes"] = int(num_classes)
-            return RFDETRSegPreview(**kwargs) if kwargs else RFDETRSegPreview()
-        except TypeError:
-            return RFDETRSegPreview()
-
-    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium  # type: ignore
-
-    cls = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium}.get(size)
-    if cls is None:
-        raise ValueError(f"Unknown model size: {size}")
-
-    kwargs: Dict[str, Any] = {}
-    if pretrain_weights:
-        kwargs["pretrain_weights"] = pretrain_weights
-    if num_classes is not None:
-        kwargs["num_classes"] = int(num_classes)
-    try:
-        return cls(**kwargs) if kwargs else cls()
-    except TypeError:
-        return cls()
+    model, _, _ = instantiate_rfdetr_model(task, size, num_classes=num_classes, pretrain_weights=pretrain_weights)
+    return model
 
 
 def _find_torch_module(model: object):
-    import torch
     import torch.nn as nn
 
-    if isinstance(model, nn.Module):
-        return model
+    from .torch_compat import unwrap_torch_module
 
-    for attr in ("model", "net", "network", "module", "detector", "backbone", "transformer"):
-        inner = getattr(model, attr, None)
-        if inner is None:
-            continue
-        if isinstance(inner, nn.Module):
-            return inner
-
-    # best-effort: search one level deep through __dict__
-    try:
-        for _, val in vars(model).items():
-            if isinstance(val, nn.Module):
-                return val
-    except Exception:
-        pass
-
-    raise TypeError(f"Could not find a torch.nn.Module inside model object of type {type(model)}")
+    return unwrap_torch_module(model)
 
 
 def _extract_outputs(out: object, *, want_masks: bool) -> Tuple[Any, ...]:
@@ -86,9 +43,17 @@ def _extract_outputs(out: object, *, want_masks: bool) -> Tuple[Any, ...]:
 
     # dict-like
     if isinstance(out, dict):
-        logits = out.get("pred_logits") or out.get("logits")
-        boxes = out.get("pred_boxes") or out.get("boxes")
-        masks = out.get("pred_masks") or out.get("masks") or out.get("mask")
+        logits = out.get("pred_logits", None)
+        if logits is None:
+            logits = out.get("logits", None)
+        boxes = out.get("pred_boxes", None)
+        if boxes is None:
+            boxes = out.get("boxes", None)
+        masks = out.get("pred_masks", None)
+        if masks is None:
+            masks = out.get("masks", None)
+        if masks is None:
+            masks = out.get("mask", None)
         t_logits = _as_tensor(logits)
         t_boxes = _as_tensor(boxes)
         t_masks = _as_tensor(masks)
@@ -158,10 +123,16 @@ def export_onnx(
     except Exception as e:
         return ExportResult(False, None, f"Failed to instantiate model: {e}")
 
+    # Unwrap early: `rfdetr` returns wrapper objects; the real torch module is nested.
+    try:
+        module = _find_torch_module(model)
+    except Exception as e:
+        return ExportResult(False, None, f"Failed to locate torch module inside model: {e}")
+
     torch_device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     lr = load_checkpoint_weights(
-        model,
+        module,
         str(weights),
         torch_device,
         checkpoint_key=checkpoint_key,
@@ -173,8 +144,25 @@ def export_onnx(
         return ExportResult(False, None, f"Failed to load weights: {lr.message}")
     if lr.replacement_model is not None:
         model = lr.replacement_model
+        try:
+            module = _find_torch_module(model)
+        except Exception as e:
+            return ExportResult(False, None, f"Failed to locate torch module inside checkpoint model: {e}")
 
-    module = _find_torch_module(model)
+    # Ensure dummy input sizes satisfy backbone divisibility constraints (e.g. DINOv2 patch size).
+    from .torch_compat import infer_backbone_patch_size
+
+    ps = infer_backbone_patch_size(module)
+    if ps:
+        hh = int(height)
+        ww = int(width)
+        adj_h = hh - (hh % ps)
+        adj_w = ww - (ww % ps)
+        if adj_h <= 0 or adj_w <= 0:
+            return ExportResult(False, None, f"Invalid export size {hh}x{ww} for patch_size={ps}.")
+        if adj_h != hh or adj_w != ww:
+            print(f"Note: adjusting export size from {hh}x{ww} to {adj_h}x{adj_w} to satisfy patch_size={ps}.")
+            height, width = adj_h, adj_w
     try:
         module.to(torch_device)
     except Exception:
@@ -182,6 +170,71 @@ def export_onnx(
     module.eval()
 
     want_masks = (task or "").lower().strip() == "seg"
+
+    # ONNX exporter currently does not support antialiased upsampling ops like
+    # `aten::_upsample_bicubic2d_aa`. We disable `antialias=True` during export
+    # to keep the graph exportable (deployment-friendly approximation).
+    import contextlib
+    import torch.nn.functional as F
+
+    @contextlib.contextmanager
+    def _disable_interpolate_antialias_for_onnx():
+        orig = F.interpolate
+
+        def patched(*args, **kwargs):
+            # Handle both keyword and positional `antialias`.
+            aa = kwargs.get("antialias", None)
+            if aa is None and len(args) >= 7 and isinstance(args[6], bool):
+                aa = args[6]
+            if aa is True:
+                if "antialias" in kwargs:
+                    kwargs["antialias"] = False
+                elif len(args) >= 7:
+                    args = list(args)
+                    args[6] = False
+                    args = tuple(args)
+                else:
+                    kwargs["antialias"] = False
+            return orig(*args, **kwargs)
+
+        F.interpolate = patched  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            F.interpolate = orig  # type: ignore[assignment]
+
+    @contextlib.contextmanager
+    def _patch_rfdetr_projector_layernorm_for_onnx():
+        """Patch rfdetr's projector.LayerNorm to use constant normalized_shape.
+
+        The upstream implementation uses `(x.size(3),)` which creates a dynamic
+        `List[int]` in the graph and fails ONNX export.
+        """
+
+        try:
+            from rfdetr.models.backbone import projector as _proj  # type: ignore
+
+            LayerNorm = getattr(_proj, "LayerNorm", None)
+            if LayerNorm is None:
+                yield
+                return
+
+            orig_forward = LayerNorm.forward
+
+            def forward(self, x):
+                x = x.permute(0, 2, 3, 1)
+                x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+                x = x.permute(0, 3, 1, 2)
+                return x
+
+            LayerNorm.forward = forward
+            try:
+                yield
+            finally:
+                LayerNorm.forward = orig_forward
+        except Exception:
+            # If rfdetr isn't installed or the module path differs, just skip.
+            yield
 
     class OnnxWrapper(nn.Module):
         def __init__(self, inner: nn.Module, want_masks: bool):
@@ -220,18 +273,34 @@ def export_onnx(
             dynamic_axes["pred_masks"] = {0: "batch", 1: "num_queries", 2: "mask_h", 3: "mask_w"}
 
     try:
-        torch.onnx.export(
-            wrapper,
-            dummy,
-            str(output),
-            export_params=True,
-            opset_version=int(opset),
-            do_constant_folding=True,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-        )
+        def _do_export(opset_version: int) -> None:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(_disable_interpolate_antialias_for_onnx())
+                stack.enter_context(_patch_rfdetr_projector_layernorm_for_onnx())
+                torch.onnx.export(
+                    wrapper,
+                    dummy,
+                    str(output),
+                    export_params=True,
+                    opset_version=int(opset_version),
+                    do_constant_folding=True,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                )
+
+        _do_export(int(opset))
     except Exception as e:
+        msg = str(e)
+        # PyTorch sometimes only supports certain ops (e.g. antialiased bicubic resize)
+        # at newer ONNX opsets. If the user asked for opset 17 (old default), retry at 18.
+        if int(opset) <= 17 and "_upsample_bicubic2d_aa" in msg and "opset version 17" in msg:
+            try:
+                print("Note: retrying ONNX export with opset=18 (required for antialiased bicubic resize).")
+                _do_export(18)
+                return ExportResult(True, output, f"Wrote ONNX: {output}")
+            except Exception as e2:
+                return ExportResult(False, None, f"torch.onnx.export failed (after retry opset=18): {e2}")
         return ExportResult(False, None, f"torch.onnx.export failed: {e}")
 
     return ExportResult(True, output, f"Wrote ONNX: {output}")

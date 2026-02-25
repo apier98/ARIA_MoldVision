@@ -11,6 +11,8 @@ from .coco import (
     align_coco_categories_to_metadata,
     ensure_minimal_test_split,
     normalize_coco_category_ids,
+    prune_empty_masks_in_split,
+    prune_too_small_masks_in_split,
     reset_coco_dir,
     validate_coco_split,
 )
@@ -47,6 +49,26 @@ def _parse_classes(values: List[str] | None, classes_file: str | None) -> List[s
     return out
 
 
+def _load_jsonish(path: str) -> dict:
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p}")
+    txt = p.read_text(encoding="utf-8")
+    try:
+        return json.loads(txt)
+    except Exception:
+        # best-effort YAML support if installed
+        try:
+            import yaml  # type: ignore
+
+            obj = yaml.safe_load(txt)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    raise ValueError(f"Could not parse config as JSON (or YAML): {p}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rfdetrw", description="RF-DETR training workspace (CLI)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -59,13 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--dataset-dir", "-d", required=True)
     ex.add_argument("--weights", "-w", required=True, help="Checkpoint path (.pth)")
     ex.add_argument("--task", choices=["detect", "seg"], default="detect")
-    ex.add_argument("--size", choices=["nano", "small", "base", "medium"], default="nano", help="Detection model size (ignored if using checkpoint model)")
+    ex.add_argument(
+        "--size",
+        choices=["nano", "small", "base", "medium", "large", "xlarge", "2xlarge"],
+        default="nano",
+        help="Model size preset (some sizes may require rfdetr[plus]; ignored if using checkpoint model)",
+    )
     ex.add_argument("--format", choices=["onnx", "tensorrt"], default="onnx")
     ex.add_argument("--output", "-o", default=None, help="Output path (.onnx or .engine). Default: datasets/<UUID>/exports/")
     ex.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     ex.add_argument("--height", type=int, default=640)
     ex.add_argument("--width", type=int, default=640)
-    ex.add_argument("--opset", type=int, default=17, help="ONNX opset")
+    ex.add_argument("--opset", type=int, default=18, help="ONNX opset")
     ex.add_argument("--dynamic", action="store_true", help="Dynamic input H/W axes (ONNX only)")
     ex.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
     ex.add_argument("--checkpoint-key", default=None, help="Explicit key inside checkpoint that contains state_dict")
@@ -89,13 +116,23 @@ def build_parser() -> argparse.ArgumentParser:
     bd = sub.add_parser("bundle", help="Create a portable deployment bundle (checkpoint + configs + runner)")
     bd.add_argument("--dataset-dir", "-d", required=True)
     bd.add_argument("--weights", "-w", required=True, help="Checkpoint path (.pth)")
-    bd.add_argument("--task", choices=["detect", "seg"], default="detect")
-    bd.add_argument("--size", choices=["nano", "small", "base", "medium"], default="nano", help="Detection model size (ignored if using checkpoint model)")
+    bd.add_argument(
+        "--task",
+        choices=["detect", "seg"],
+        default=None,
+        help="Task for the bundle. Default: auto (from datasets/<UUID>/models/model_config.json)",
+    )
+    bd.add_argument(
+        "--size",
+        choices=["nano", "small", "base", "medium", "large", "xlarge", "2xlarge"],
+        default=None,
+        help="Model size preset. Default: auto (from datasets/<UUID>/models/model_config.json)",
+    )
     bd.add_argument("--output-dir", "-o", default=None, help="Output bundle directory (default: datasets/<UUID>/deploy/<weights>_<timestamp>)")
     bd.add_argument("--height", type=int, default=None, help="Model input height (default: trained resolution or 640)")
     bd.add_argument("--width", type=int, default=None, help="Model input width (default: trained resolution or 640)")
     bd.add_argument("--export", action="append", default=None, choices=["onnx", "tensorrt"], help="Optional: include exported formats (repeatable)")
-    bd.add_argument("--opset", type=int, default=17, help="ONNX opset")
+    bd.add_argument("--opset", type=int, default=18, help="ONNX opset")
     bd.add_argument("--dynamic", action="store_true", help="ONNX: export dynamic H/W axes")
     bd.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     bd.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
@@ -162,6 +199,24 @@ def build_parser() -> argparse.ArgumentParser:
     ds_val.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
     ds_val.add_argument("--check-images", action="store_true", help="Warn if image files are missing from split dir")
 
+    ds_prune = ds_sub.add_parser(
+        "prune-empty-masks",
+        help="Segmentation: drop invalid/empty masks and remove images that have 0 masks (fixes 'masks cannot be empty')",
+    )
+    ds_prune.add_argument("--dataset-dir", "-d", required=True)
+    ds_prune.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
+    ds_prune.add_argument("--dry-run", action="store_true")
+
+    ds_prune_small = ds_sub.add_parser(
+        "prune-small-masks",
+        help="Segmentation: remove tiny instances that may vanish after resizing (prevents intermittent 'masks cannot be empty')",
+    )
+    ds_prune_small.add_argument("--dataset-dir", "-d", required=True)
+    ds_prune_small.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
+    ds_prune_small.add_argument("--resolution", type=int, required=True, help="Square resize resolution used for training (e.g. 312/448)")
+    ds_prune_small.add_argument("--min-scaled-area", type=float, default=1.0, help="Min instance area after scaling to resolution (pixels^2)")
+    ds_prune_small.add_argument("--dry-run", action="store_true")
+
     ds_norm = ds_sub.add_parser("normalize-coco-ids", help="Normalize COCO category ids to contiguous 0..N-1 (safe backup)")
     ds_norm.add_argument("--dataset-dir", "-d", required=True)
     ds_norm.add_argument("--split", choices=["train", "valid", "test", "all"], default="all")
@@ -214,7 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("train", help="Train an RF-DETR model")
     tr.add_argument("--dataset-dir", "-d", required=True)
     tr.add_argument("--task", choices=["detect", "seg"], default="detect")
-    tr.add_argument("--size", choices=["nano", "small", "base", "medium"], default="nano")
+    tr.add_argument(
+        "--size",
+        choices=["nano", "small", "base", "medium", "large", "xlarge", "2xlarge"],
+        default="nano",
+        help="Model size preset (some sizes may require rfdetr[plus])",
+    )
     tr.add_argument("--epochs", type=int, default=20)
     tr.add_argument("--batch-size", type=int, default=4)
     tr.add_argument("--grad-accum", type=int, default=4)
@@ -239,6 +299,28 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--num-select", type=int, default=None)
     tr.add_argument("--run-test", action="store_true")
     tr.add_argument("--benchmark", action="store_true")
+    tr.add_argument("--no-aug", action="store_true", help="Disable augmentations (sets aug_config={})")
+    tr.add_argument("--aug-config", default=None, help="Path to JSON/YAML augmentation config (advanced)")
+    ms = tr.add_mutually_exclusive_group()
+    ms.add_argument("--multi-scale", dest="multi_scale", action="store_true", default=None, help="Enable multi-scale training")
+    ms.add_argument("--no-multi-scale", dest="multi_scale", action="store_false", help="Disable multi-scale training")
+    es = tr.add_mutually_exclusive_group()
+    es.add_argument("--expanded-scales", dest="expanded_scales", action="store_true", default=None, help="Enable expanded multi-scale ranges")
+    es.add_argument("--no-expanded-scales", dest="expanded_scales", action="store_false", help="Disable expanded multi-scale ranges")
+    rp = tr.add_mutually_exclusive_group()
+    rp.add_argument(
+        "--random-resize-via-padding",
+        dest="do_random_resize_via_padding",
+        action="store_true",
+        default=None,
+        help="Enable random resize via padding (advanced; may affect masks)",
+    )
+    rp.add_argument(
+        "--no-random-resize-via-padding",
+        dest="do_random_resize_via_padding",
+        action="store_false",
+        help="Disable random resize via padding",
+    )
 
     # safer replacements than the old "resume but partially load and then remove resume"
     tr.add_argument("--resume", default=None, help="Resume training (trainer checkpoint)")
@@ -283,13 +365,28 @@ def main(argv: List[str] | None = None) -> int:
 
             ver = getattr(rfdetr, "__version__", None)
             print(f"- rfdetr: {ver or 'importable'}")
+            # Quick model surface check (helpful when debugging size/preview fallbacks).
+            sizes = ["nano", "small", "base", "medium", "large", "xlarge", "2xlarge"]
+            suf = {"nano": "Nano", "small": "Small", "base": "Base", "medium": "Medium", "large": "Large", "xlarge": "XLarge", "2xlarge": "2XLarge"}
+            det = [s for s in sizes if hasattr(rfdetr, f"RFDETR{suf[s]}")]
+            seg = [s for s in sizes if hasattr(rfdetr, f"RFDETRSeg{suf[s]}") or hasattr(rfdetr, f"RFDETR{suf[s]}Seg")]
+            has_preview = hasattr(rfdetr, "RFDETRSegPreview")
+            if det:
+                print(f"- rfdetr detect sizes: {', '.join(det)}")
+            if seg:
+                print(f"- rfdetr seg sizes: {', '.join(seg)}")
+            if has_preview and not seg:
+                print("- rfdetr seg: only RFDETRSegPreview found (deprecated upstream)")
         except Exception as e:
             print(f"- rfdetr: not importable ({e})")
 
         if os.name == "nt":
             print("- hint: on Windows, set --num-workers 0 to avoid multiprocessing issues")
         print("- hint: if you see 'Inference tensors cannot be saved for backward', enable --patch-inference-mode")
-        print("- hint: if you see OOM, reduce --batch-size/--resolution or set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+        print(
+            "- hint: if you see OOM, reduce --batch-size/--resolution; "
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is not supported on all platforms (e.g. Windows)"
+        )
         return 0
 
     if args.cmd == "dataset" and args.dataset_cmd == "create":
@@ -348,6 +445,43 @@ def main(argv: List[str] | None = None) -> int:
                 print(f"{sp}: Warning: {w}", file=sys.stderr)
             for e in v.errors:
                 print(f"{sp}: Error: {e}", file=sys.stderr)
+        return 0 if ok else 3
+
+    if args.cmd == "dataset" and args.dataset_cmd == "prune-empty-masks":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        coco_dir = dataset_dir / "coco"
+        splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
+        ok = True
+        for sp in splits:
+            res = prune_empty_masks_in_split(coco_dir / sp, dry_run=bool(args.dry_run))
+            if not res.ok:
+                ok = False
+                print(f"{sp}: Error: {res.message}", file=sys.stderr)
+                continue
+            print(res.message)
+            if res.backup_path is not None:
+                print(f"{sp}: backup: {res.backup_path}")
+        return 0 if ok else 3
+
+    if args.cmd == "dataset" and args.dataset_cmd == "prune-small-masks":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        coco_dir = dataset_dir / "coco"
+        splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
+        ok = True
+        for sp in splits:
+            res = prune_too_small_masks_in_split(
+                coco_dir / sp,
+                resolution=int(args.resolution),
+                min_scaled_area=float(args.min_scaled_area),
+                dry_run=bool(args.dry_run),
+            )
+            if not res.ok:
+                ok = False
+                print(f"{sp}: Error: {res.message}", file=sys.stderr)
+                continue
+            print(res.message)
+            if res.backup_path is not None:
+                print(f"{sp}: backup: {res.backup_path}")
         return 0 if ok else 3
 
     if args.cmd == "dataset" and args.dataset_cmd == "normalize-coco-ids":
@@ -457,6 +591,12 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.cmd == "dataset" and args.dataset_cmd == "ingest":
         exts = [e.strip().lower() for e in args.images_ext.split(",") if e.strip()]
+        if str(args.yolo_task).strip().lower() == "seg" and bool(args.include_background):
+            print(
+                "Note: include-background is enabled. Segmentation training can crash if an image has 0 masks "
+                "('masks cannot be empty'). Consider `--no-include-background` for seg datasets.",
+                file=sys.stderr,
+            )
         res = ingest_labels_inbox(
             dataset_dir=Path(args.dataset_dir),
             train_ratio=float(args.train_ratio),
@@ -475,6 +615,9 @@ def main(argv: List[str] | None = None) -> int:
         return 0
 
     if args.cmd == "train":
+        aug_cfg = None
+        if getattr(args, "aug_config", None):
+            aug_cfg = _load_jsonish(str(args.aug_config))
         cfg = TrainConfig(
             dataset_dir=Path(args.dataset_dir),
             task=args.task,
@@ -503,6 +646,11 @@ def main(argv: List[str] | None = None) -> int:
             checkpoint_key=args.checkpoint_key,
             patch_inference_mode=args.patch_inference_mode,
             validate_dataset=(not bool(args.no_validate)),
+            multi_scale=getattr(args, "multi_scale", None),
+            expanded_scales=getattr(args, "expanded_scales", None),
+            do_random_resize_via_padding=getattr(args, "do_random_resize_via_padding", None),
+            aug_config=aug_cfg,
+            no_aug=bool(getattr(args, "no_aug", False)),
         )
         return int(train(cfg))
 

@@ -159,12 +159,15 @@ def load_checkpoint_weights(
     if hasattr(model, "load_state_dict") and callable(getattr(model, "load_state_dict")):
         target = model
     else:
-        for attr in ("model", "net", "network", "module", "detector", "backbone", "transformer"):
-            inner = getattr(model, attr, None)
-            if inner is not None and hasattr(inner, "load_state_dict") and callable(getattr(inner, "load_state_dict")):
-                target = inner
-                break
-    if target is None:
+        # Common wrappers (including `rfdetr`): the actual nn.Module is often nested.
+        try:
+            from .torch_compat import unwrap_torch_module
+
+            target = unwrap_torch_module(model)
+        except Exception:
+            target = None
+
+    if target is None or not hasattr(target, "load_state_dict") or not callable(getattr(target, "load_state_dict")):
         return LoadResult(False, None, "Model does not support load_state_dict")
 
     # Prepare a compatibility report.
@@ -196,36 +199,63 @@ def load_checkpoint_weights(
 
         if strict:
             if missing or unexpected or mismatched:
-                # Fail fast for deployment: partial loads are a foot-gun.
-                parts: List[str] = ["Strict checkpoint load failed:"]
-                if missing:
-                    parts.append(f"- missing keys: {len(missing)}")
-                if unexpected:
-                    parts.append(f"- unexpected keys: {len(unexpected)}")
-                if mismatched:
-                    parts.append(f"- mismatched shapes: {len(mismatched)}")
-                # show a small sample so the user can diagnose quickly
-                if missing:
-                    parts.append(f"- missing sample: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}")
-                if unexpected:
-                    parts.append(
-                        f"- unexpected sample: {', '.join(unexpected[:10])}{' ...' if len(unexpected) > 10 else ''}"
+                # Try a targeted fix for common RF-DETR custom-dataset checkpoints:
+                # resize class head layers to match state_dict shapes.
+                if not missing and not unexpected and mismatched:
+                    try:
+                        from .torch_compat import maybe_resize_rfdetr_class_heads_for_state_dict
+
+                        changed = maybe_resize_rfdetr_class_heads_for_state_dict(target, state, verbose=verbose)
+                        if changed:
+                            # recompute mismatch report after resizing
+                            target_state = target.state_dict()  # type: ignore[attr-defined]
+                            missing = [str(k) for k in target_state.keys() if k not in state]
+                            unexpected = [str(k) for k in state.keys() if k not in target_state]
+                            mismatched = []
+                            for k, v in state.items():
+                                if k not in target_state:
+                                    continue
+                                try:
+                                    exp = getattr(target_state[k], "shape", None)
+                                    got = getattr(v, "shape", None)
+                                    if exp is not None and got is not None and tuple(exp) != tuple(got):
+                                        mismatched.append((str(k), str(tuple(exp)), str(tuple(got))))
+                                except Exception:
+                                    mismatched.append((str(k), "unknown", "unknown"))
+                    except Exception:
+                        pass
+
+                if missing or unexpected or mismatched:
+                    # Fail fast for deployment: partial loads are a foot-gun.
+                    parts: List[str] = ["Strict checkpoint load failed:"]
+                    if missing:
+                        parts.append(f"- missing keys: {len(missing)}")
+                    if unexpected:
+                        parts.append(f"- unexpected keys: {len(unexpected)}")
+                    if mismatched:
+                        parts.append(f"- mismatched shapes: {len(mismatched)}")
+                    # show a small sample so the user can diagnose quickly
+                    if missing:
+                        parts.append(f"- missing sample: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}")
+                    if unexpected:
+                        parts.append(
+                            f"- unexpected sample: {', '.join(unexpected[:10])}{' ...' if len(unexpected) > 10 else ''}"
+                        )
+                    if mismatched:
+                        sm = mismatched[:10]
+                        parts.append(
+                            "- mismatched sample: "
+                            + ", ".join([f"{k} exp={e} got={g}" for (k, e, g) in sm])
+                            + (" ..." if len(mismatched) > 10 else "")
+                        )
+                    return LoadResult(
+                        False,
+                        None,
+                        "\n".join(parts),
+                        missing_keys=tuple(missing),
+                        unexpected_keys=tuple(unexpected),
+                        mismatched_shapes=tuple(mismatched),
                     )
-                if mismatched:
-                    sm = mismatched[:10]
-                    parts.append(
-                        "- mismatched sample: "
-                        + ", ".join([f"{k} exp={e} got={g}" for (k, e, g) in sm])
-                        + (" ..." if len(mismatched) > 10 else "")
-                    )
-                return LoadResult(
-                    False,
-                    None,
-                    "\n".join(parts),
-                    missing_keys=tuple(missing),
-                    unexpected_keys=tuple(unexpected),
-                    mismatched_shapes=tuple(mismatched),
-                )
 
             if verbose:
                 print("Strict load: checkpoint and model state_dicts match. Loading with strict=True.")

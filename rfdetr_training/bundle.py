@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .datasets import load_metadata
 from .export import export_onnx, export_tensorrt_from_onnx
+from .model_factory import instantiate_rfdetr_model
 
 
 @dataclass(frozen=True)
@@ -108,18 +109,8 @@ def unletterbox_xyxy(b: List[float], info: Dict[str, Any]) -> List[float]:
 
 
 def instantiate_model(task: str, size: str, num_classes: Optional[int]):
-    task = (task or "detect").lower().strip()
-    if task == "seg":
-        from rfdetr import RFDETRSegPreview  # type: ignore
-        return RFDETRSegPreview()
-    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium  # type: ignore
-    cls = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium}.get(size)
-    if cls is None:
-        raise ValueError(f"Unknown size: {size}")
-    try:
-        return cls(num_classes=int(num_classes)) if num_classes is not None else cls()
-    except TypeError:
-        return cls()
+    model, _, _ = instantiate_rfdetr_model(task, size, num_classes=num_classes, pretrain_weights=None)
+    return model
 
 
 def load_weights(model: Any, weights_path: Path, device: torch.device, *, use_checkpoint_model: bool, checkpoint_key: Optional[str], strict: bool) -> Any:
@@ -384,8 +375,8 @@ def create_bundle(
     *,
     dataset_dir: Path,
     weights: Path,
-    task: str,
-    size: str,
+    task: Optional[str],
+    size: Optional[str],
     output_dir: Optional[Path],
     height: Optional[int],
     width: Optional[int],
@@ -441,12 +432,16 @@ def create_bundle(
     h = int(height) if height else 640
     w = int(width) if width else 640
 
+    # Resolve task/size: prefer explicit CLI args; otherwise use training metadata.
+    task_final = str((task or trained_model_cfg.get("task") or "detect")).strip().lower()
+    size_final = str((size or trained_model_cfg.get("size") or "nano")).strip().lower()
+
     # Write configs at bundle root.
     _write_json(bundle_dir / "classes.json", list(class_names))
     model_config = {
         "format_version": 1,
-        "task": (task or trained_model_cfg.get("task") or "detect").strip().lower(),
-        "size": (size or trained_model_cfg.get("size") or "nano").strip().lower(),
+        "task": task_final,
+        "size": size_final,
         "num_classes": int(len(class_names)) if class_names else None,
         "class_names": list(class_names),
         "resolution": trained_res if trained_res is not None else None,
@@ -473,7 +468,11 @@ def create_bundle(
         "mask_threshold_default": 0.5,
         "mask_alpha_default": 0.45,
         "topk_default": 300,
-        "note": "If model returns DETR raw outputs (pred_logits/pred_boxes), decode uses softmax and drops the last no-object class.",
+        "nms_iou_threshold_default": 0.7,
+        "mask_nms_iou_threshold_default": 0.8,
+        "max_dets_default": 100,
+        "min_box_size_default": 1.0,
+        "note": "Postprocess: decode DETR raw outputs (pred_logits/pred_boxes) using softmax (drop last no-object class) when logits have C+1 dims, otherwise sigmoid for C dims. Then filter degenerate boxes and apply optional NMS.",
     }
     _write_json(bundle_dir / "postprocess.json", postprocess)
 
@@ -485,6 +484,21 @@ def create_bundle(
     runner_path = Path(__file__).with_name("bundle_runner.py")
     (bundle_dir / "infer.py").write_text(runner_path.read_text(encoding="utf-8"), encoding="utf-8")
     (bundle_dir / "requirements.txt").write_text("torch\ntorchvision\nrfdetr\npillow\nnumpy\n", encoding="utf-8")
+
+    # Vendor the minimal source package into the bundle so `python infer.py` works
+    # without requiring `pip install -e .` or setting PYTHONPATH.
+    src_pkg_dir = Path(__file__).resolve().parent
+    dst_pkg_dir = bundle_dir / src_pkg_dir.name
+    try:
+        if not dst_pkg_dir.exists():
+            shutil.copytree(
+                src_pkg_dir,
+                dst_pkg_dir,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+    except Exception:
+        # Best-effort: bundle still contains ONNX/TensorRT exports if requested.
+        pass
     (bundle_dir / "README.md").write_text(
         "\n".join(
             [
@@ -499,6 +513,7 @@ def create_bundle(
                 "",
                 "Notes:",
                 "- Preprocess keeps aspect ratio (letterbox) per `preprocess.json`.",
+                "- This bundle includes a vendored copy of the `rfdetr_training` package so `infer.py` can run without installing this repo.",
                 "- For best portability, checkpoints should be state_dict-based (not pickled model objects).",
                 "",
             ]

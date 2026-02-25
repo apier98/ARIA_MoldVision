@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .model_factory import instantiate_rfdetr_model
 from .deploy import (
     detections_to_json,
     letterbox_pil,
@@ -26,21 +27,14 @@ class InferResult:
 
 
 def _instantiate_model(task: str, size: str, num_classes: Optional[int]):
-    task = (task or "detect").lower().strip()
-    if task == "seg":
-        from rfdetr import RFDETRSegPreview  # type: ignore
+    model, _, _ = instantiate_rfdetr_model(task, size, num_classes=num_classes, pretrain_weights=None)
+    return model
 
-        return RFDETRSegPreview()
 
-    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium  # type: ignore
+def _unwrap_for_inference(model: object):
+    from .torch_compat import unwrap_torch_module
 
-    cls = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium}.get(size)
-    if cls is None:
-        raise ValueError(f"Unknown model size: {size}")
-    try:
-        return cls(num_classes=int(num_classes)) if num_classes is not None else cls()
-    except TypeError:
-        return cls()
+    return unwrap_torch_module(model)
 
 
 def infer_from_bundle(
@@ -92,10 +86,16 @@ def infer_from_bundle(
     except Exception as e:
         return InferResult(False, None, f"Failed to instantiate model: {e}")
 
+    # `rfdetr` wrappers are not callable; use the underlying torch.nn.Module for inference.
+    try:
+        module = _unwrap_for_inference(model)
+    except Exception as e:
+        return InferResult(False, None, f"Failed to locate torch module inside model: {e}")
+
     from .checkpoints import load_checkpoint_weights
 
     lr = load_checkpoint_weights(
-        model,
+        module,
         str(weights),
         device_t,
         checkpoint_key=checkpoint_key,
@@ -107,6 +107,13 @@ def infer_from_bundle(
         return InferResult(False, None, f"Failed to load weights: {lr.message}")
     if lr.replacement_model is not None:
         model = lr.replacement_model
+        try:
+            module = _unwrap_for_inference(model)
+        except Exception as e:
+            return InferResult(False, None, f"Failed to locate torch module inside checkpoint model: {e}")
+
+    # from here on, run inference on the torch module
+    model = module
 
     try:
         if hasattr(model, "to"):

@@ -12,6 +12,16 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFont
 
+from rfdetr_training.model_factory import instantiate_rfdetr_model
+from rfdetr_training.checkpoints import load_checkpoint_weights
+from rfdetr_training.torch_compat import infer_backbone_patch_size, unwrap_torch_module
+
+
+def _first_present(d: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    return None
 
 def _read_json(path: Path) -> Dict[str, Any]:
     try:
@@ -104,10 +114,18 @@ def unletterbox_masks(
 
 
 def _color_for_id(i: int) -> Tuple[int, int, int]:
-    r = (37 * (i + 1)) % 255
-    g = (17 * (i + 1)) % 255
-    b = (97 * (i + 1)) % 255
-    return int(r), int(g), int(b)
+    # Bright, readable palette (cycled by class id).
+    palette = [
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 128, 255),
+        (255, 128, 0),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 0),
+        (255, 255, 255),
+    ]
+    return palette[int(i) % len(palette)]
 
 
 def overlay_masks_pil(base: Image.Image, masks: List[np.ndarray], labels: List[int], alpha: float) -> Image.Image:
@@ -127,8 +145,12 @@ def overlay_masks_pil(base: Image.Image, masks: List[np.ndarray], labels: List[i
             mm_img = mm_img.resize((w, h), resample=Image.NEAREST)
             mm = (np.asarray(mm_img) > 127)
         color = _color_for_id(labels[i] if i < len(labels) else i)
-        mask_img = Image.fromarray((mm.astype(np.uint8) * int(round(alpha * 255))))
-        overlay.paste((*color, int(round(alpha * 255))), (0, 0), mask_img)
+        # IMPORTANT: apply alpha exactly once.
+        # If we set both the pasted RGBA alpha and the paste mask to `alpha`,
+        # the effective opacity becomes ~alpha^2 (too faint).
+        a = int(round(max(0.0, min(1.0, float(alpha))) * 255))
+        mask_img = Image.fromarray((mm.astype(np.uint8) * a))
+        overlay.paste((*color, 255), (0, 0), mask_img)
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 
@@ -153,21 +175,8 @@ def draw_boxes_pil(base: Image.Image, boxes: List[List[float]], scores: List[flo
 
 
 def instantiate_model(task: str, size: str, num_classes: Optional[int]):
-    task = (task or "detect").lower().strip()
-    if task == "seg":
-        from rfdetr import RFDETRSegPreview  # type: ignore
-
-        return RFDETRSegPreview()
-
-    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium  # type: ignore
-
-    cls = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium}.get(size)
-    if cls is None:
-        raise ValueError(f"Unknown size: {size}")
-    try:
-        return cls(num_classes=int(num_classes)) if num_classes is not None else cls()
-    except TypeError:
-        return cls()
+    model, _, _ = instantiate_rfdetr_model(task, size, num_classes=num_classes, pretrain_weights=None)
+    return model
 
 
 def load_weights(
@@ -179,69 +188,123 @@ def load_weights(
     checkpoint_key: Optional[str],
     strict: bool,
 ) -> Any:
-    ckpt = None
-    try:
-        ckpt = torch.load(str(weights_path), map_location=device)
-    except Exception:
-        ckpt = torch.load(str(weights_path), map_location=device, weights_only=False)
-
-    if use_checkpoint_model and isinstance(ckpt, dict):
-        for cand in ("ema_model", "model"):
-            if cand in ckpt and hasattr(ckpt[cand], "state_dict"):
-                if strict:
-                    raise RuntimeError("strict=True disallows using pickled checkpoint model objects")
-                return ckpt[cand]
-
-    state = None
-    if isinstance(ckpt, dict):
-        if checkpoint_key and checkpoint_key in ckpt and isinstance(ckpt[checkpoint_key], dict):
-            state = ckpt[checkpoint_key]
-        else:
-            for key in ("model_state_dict", "state_dict", "model", "net"):
-                if key in ckpt and isinstance(ckpt[key], dict):
-                    state = ckpt[key]
-                    break
-        if state is None and any(k.startswith("transformer") or k.startswith("backbone") or "class_embed" in str(k) for k in ckpt.keys()):
-            state = ckpt
-
-    if not isinstance(state, dict):
-        if hasattr(model, "load"):
-            model.load(str(weights_path))
-            return model
-        raise RuntimeError("Could not find a state_dict in checkpoint")
-
-    target = model
-    if not hasattr(target, "load_state_dict"):
-        for attr in ("model", "net", "network", "module", "detector", "backbone", "transformer"):
-            inner = getattr(model, attr, None)
-            if inner is not None and hasattr(inner, "load_state_dict"):
-                target = inner
-                break
-
-    if strict:
-        target.load_state_dict(state, strict=True)
-    else:
-        try:
-            tgt_state = target.state_dict()
-            filtered = {k: v for k, v in state.items() if k in tgt_state and getattr(v, "shape", None) == getattr(tgt_state[k], "shape", None)}
-        except Exception:
-            filtered = state
-        target.load_state_dict(filtered, strict=False)
-    try:
-        target.to(device)
-    except Exception:
-        pass
+    module = unwrap_torch_module(model)
+    lr = load_checkpoint_weights(
+        module,
+        str(weights_path),
+        device,
+        checkpoint_key=checkpoint_key,
+        allow_replace_model=bool(use_checkpoint_model),
+        strict=bool(strict),
+        verbose=True,
+    )
+    if not lr.ok and lr.replacement_model is None:
+        raise RuntimeError(f"Failed to load weights: {lr.message}")
+    if lr.replacement_model is not None:
+        model = lr.replacement_model
     return model
 
 
 def run_inference(model: Any, tensor: torch.Tensor):
-    for name in ("predict", "infer", "inference", "forward", "detect"):
-        fn = getattr(model, name, None)
-        if callable(fn):
-            return fn(tensor)
-    if callable(model):
-        return model(tensor)
-    raise RuntimeError("Model is not callable and has no predict/infer method")
+    return model(tensor)
+
+
+def _filter_degenerate(
+    boxes: List[List[float]],
+    scores: List[float],
+    labels: List[int],
+    *,
+    min_box_size: float,
+) -> List[int]:
+    keep: List[int] = []
+    mbs = float(min_box_size)
+    for i, b in enumerate(boxes):
+        x1, y1, x2, y2 = [float(v) for v in b]
+        if (x2 - x1) < mbs or (y2 - y1) < mbs:
+            continue
+        if not np.isfinite([x1, y1, x2, y2, float(scores[i]), float(labels[i])]).all():
+            continue
+        keep.append(int(i))
+    return keep
+
+
+def _apply_nms(
+    boxes: List[List[float]],
+    scores: List[float],
+    labels: List[int],
+    *,
+    iou_thresh: float,
+    max_dets: int,
+) -> List[int]:
+    if not boxes:
+        return []
+    if iou_thresh is None:
+        return list(range(len(boxes)))
+    iou = float(iou_thresh)
+    if iou <= 0.0 or iou >= 1.0:
+        return list(range(len(boxes)))
+
+    try:
+        from torchvision.ops import nms as tv_nms
+    except Exception:
+        return list(range(len(boxes)))
+
+    bt = torch.tensor(boxes, dtype=torch.float32)
+    st = torch.tensor(scores, dtype=torch.float32)
+    lt = torch.tensor(labels, dtype=torch.int64)
+
+    keep_all: List[int] = []
+    for cls_id in torch.unique(lt).tolist():
+        cls_id = int(cls_id)
+        idx = torch.nonzero(lt == cls_id, as_tuple=False).squeeze(1)
+        if idx.numel() == 0:
+            continue
+        keep_rel = tv_nms(bt[idx], st[idx], iou)
+        keep_all.extend(idx[keep_rel].tolist())
+
+    # Keep in descending score order.
+    keep_all = sorted(keep_all, key=lambda i: float(scores[i]), reverse=True)
+    md = int(max_dets) if int(max_dets) > 0 else len(keep_all)
+    return keep_all[:md]
+
+
+def _apply_mask_nms(
+    masks: torch.Tensor,
+    scores: List[float],
+    *,
+    iou_thresh: float,
+    max_dets: int,
+) -> List[int]:
+    """Greedy NMS on binary masks (N,H,W) using IoU."""
+    if not isinstance(masks, torch.Tensor) or masks.ndim != 3:
+        return list(range(len(scores)))
+    iou = float(iou_thresh)
+    if iou <= 0.0 or iou >= 1.0:
+        return list(range(len(scores)))
+
+    n = int(masks.shape[0])
+    if n == 0:
+        return []
+
+    # sort by score desc
+    order = sorted(range(min(n, len(scores))), key=lambda i: float(scores[i]), reverse=True)
+    keep: List[int] = []
+    areas = masks.to(dtype=torch.float32).sum(dim=(1, 2)).clamp(min=1.0)
+    md = int(max_dets) if int(max_dets) > 0 else n
+
+    while order and len(keep) < md:
+        i = int(order.pop(0))
+        keep.append(i)
+        if not order:
+            break
+
+        mi = masks[i].to(dtype=torch.float32)
+        inter = (masks[order].to(dtype=torch.float32) * mi).sum(dim=(1, 2))
+        union = areas[order] + areas[i] - inter
+        ious = inter / union.clamp(min=1.0)
+        order = [j for j, v in zip(order, ious.tolist()) if float(v) < iou]
+
+    return keep
 
 
 def parse_detections_and_masks(
@@ -259,7 +322,7 @@ def parse_detections_and_masks(
         b = out.get("boxes")
         s = out.get("scores")
         l = out.get("labels") or out.get("classes")
-        m = out.get("masks") or out.get("mask") or out.get("pred_masks")
+        m = _first_present(out, ("masks", "mask", "pred_masks"))
         if isinstance(b, torch.Tensor):
             b = b.detach().cpu()
             if b.numel() == 0:
@@ -302,7 +365,7 @@ def parse_detections_and_masks(
     if isinstance(out, dict) and "pred_logits" in out and "pred_boxes" in out:
         logits = out["pred_logits"]
         boxes = out["pred_boxes"]
-        masks = out.get("pred_masks") or out.get("masks") or out.get("mask")
+        masks = _first_present(out, ("pred_masks", "masks", "mask"))
         if isinstance(logits, torch.Tensor) and logits.ndim == 3:
             logits = logits[0]
         if isinstance(boxes, torch.Tensor) and boxes.ndim == 3:
@@ -369,12 +432,39 @@ def parse_detections_and_masks(
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run inference using a portable RF-DETR bundle directory")
     ap.add_argument("--bundle-dir", default=".", help="Bundle directory (contains checkpoint.pth + *config.json)")
+    ap.add_argument("--task", choices=["detect", "seg"], default=None, help="Override task (detect/seg). Default: from model_config.json")
+    ap.add_argument("--size", default=None, help="Override model size preset (nano/small/base/...). Default: from model_config.json")
     ap.add_argument("--image", "-i", required=True, help="Path to an image")
     ap.add_argument("--weights", default=None, help="Override weights path (default: bundle/checkpoint.pth)")
     ap.add_argument("--device", default=None, help="cuda, cuda:0, cpu (default: auto)")
     ap.add_argument("--threshold", type=float, default=None, help="Override score threshold")
     ap.add_argument("--mask-thresh", type=float, default=None, help="Override mask threshold (seg only)")
     ap.add_argument("--mask-alpha", type=float, default=None, help="Mask overlay alpha (seg only)")
+    ap.add_argument(
+        "--out-masks-dir",
+        default=None,
+        help="Segmentation: optional directory to write per-instance mask PNGs. If set, JSON detections will include mask_path.",
+    )
+    boxes_group = ap.add_mutually_exclusive_group()
+    boxes_group.add_argument(
+        "--boxes",
+        action="store_true",
+        help="Draw bounding boxes on the output image. Default: enabled for detect, disabled for seg.",
+    )
+    boxes_group.add_argument(
+        "--no-boxes",
+        action="store_true",
+        help="Do not draw bounding boxes on the output image.",
+    )
+    ap.add_argument("--nms-iou", type=float, default=None, help="IoU threshold for NMS (0..1). Default: from postprocess.json; set <=0 to disable")
+    ap.add_argument(
+        "--mask-nms-iou",
+        type=float,
+        default=None,
+        help="Segmentation: IoU threshold for mask-NMS (0..1) to remove near-duplicate masks. Default: from postprocess.json; set <=0 to disable",
+    )
+    ap.add_argument("--max-dets", type=int, default=None, help="Max detections after NMS/filtering. Default: from postprocess.json")
+    ap.add_argument("--min-box-size", type=float, default=None, help="Drop boxes with width/height < this (pixels, original model space). Default: from postprocess.json")
     ap.add_argument("--out-json", default=None, help="Write detections JSON")
     ap.add_argument("--out-image", default=None, help="Write overlay image (PNG/JPG)")
     ap.add_argument("--use-checkpoint-model", action="store_true", help="Allow using a pickled model object from the checkpoint (trusted only)")
@@ -389,8 +479,8 @@ def main() -> int:
     pre_cfg = cfg.get("preprocess", {}) or {}
     post_cfg = cfg.get("postprocess", {}) or {}
 
-    task = (model_cfg.get("task") or "detect").strip().lower()
-    size = (model_cfg.get("size") or "nano").strip().lower()
+    task = (args.task or model_cfg.get("task") or "detect").strip().lower()
+    size = (args.size or model_cfg.get("size") or "nano").strip().lower()
     class_names = cfg.get("classes", []) or []
     if isinstance(class_names, dict) and "class_names" in class_names:
         class_names = class_names["class_names"]
@@ -406,19 +496,39 @@ def main() -> int:
     if not weights_path.exists():
         raise SystemExit(f"Weights not found: {weights_path}")
 
-    model = instantiate_model(task=task, size=size, num_classes=num_classes)
-    model = load_weights(
-        model,
+    model_obj = instantiate_model(task=task, size=size, num_classes=num_classes)
+    model_obj = load_weights(
+        model_obj,
         weights_path,
         device,
         use_checkpoint_model=bool(args.use_checkpoint_model),
         checkpoint_key=args.checkpoint_key,
         strict=bool(args.strict),
     )
+
+    # Always run inference on the real torch.nn.Module, in eval mode.
+    model = unwrap_torch_module(model_obj)
     try:
         model.to(device).eval()
     except Exception:
-        pass
+        try:
+            model.eval()
+        except Exception:
+            pass
+
+    # Some backbones require input H/W divisible by patch size (e.g. seg often uses 12).
+    try:
+        ps = infer_backbone_patch_size(model)
+    except Exception:
+        ps = None
+    if ps:
+        adj_tw = int(tw) - (int(tw) % int(ps))
+        adj_th = int(th) - (int(th) % int(ps))
+        if adj_tw <= 0 or adj_th <= 0:
+            raise SystemExit(f"Invalid preprocess size {tw}x{th} for patch_size={ps}")
+        if adj_tw != int(tw) or adj_th != int(th):
+            print(f"Note: adjusting preprocess size from {tw}x{th} to {adj_tw}x{adj_th} to satisfy patch_size={ps}.")
+            tw, th = int(adj_tw), int(adj_th)
 
     orig = Image.open(args.image).convert("RGB")
     if policy == "letterbox":
@@ -436,6 +546,10 @@ def main() -> int:
     mask_thresh = float(args.mask_thresh) if args.mask_thresh is not None else float(post_cfg.get("mask_threshold_default", 0.5))
     mask_alpha = float(args.mask_alpha) if args.mask_alpha is not None else float(post_cfg.get("mask_alpha_default", 0.45))
     topk = int(args.topk) if args.topk is not None else int(post_cfg.get("topk_default", 300))
+    nms_iou = float(args.nms_iou) if args.nms_iou is not None else float(post_cfg.get("nms_iou_threshold_default", 0.7))
+    mask_nms_iou = float(args.mask_nms_iou) if args.mask_nms_iou is not None else float(post_cfg.get("mask_nms_iou_threshold_default", 0.8))
+    max_dets = int(args.max_dets) if args.max_dets is not None else int(post_cfg.get("max_dets_default", 100))
+    min_box_size = float(args.min_box_size) if args.min_box_size is not None else float(post_cfg.get("min_box_size_default", 1.0))
 
     boxes, scores, labels, masks_t = parse_detections_and_masks(
         out,
@@ -445,35 +559,109 @@ def main() -> int:
         mask_thresh=float(mask_thresh),
         topk=int(topk),
     )
+
+    # Drop degenerate boxes and optionally NMS before unletterboxing.
+    keep = _filter_degenerate(boxes, scores, labels, min_box_size=float(min_box_size))
+    if keep:
+        boxes = [boxes[i] for i in keep]
+        scores = [scores[i] for i in keep]
+        labels = [labels[i] for i in keep]
+        if (
+            isinstance(masks_t, torch.Tensor)
+            and masks_t.ndim == 3
+            and len(keep) > 0
+            and int(masks_t.shape[0]) > int(max(keep))
+        ):
+            masks_t = masks_t[keep]
+    if boxes:
+        keep2 = _apply_nms(boxes, scores, labels, iou_thresh=float(nms_iou), max_dets=int(max_dets))
+        if keep2:
+            boxes = [boxes[i] for i in keep2]
+            scores = [scores[i] for i in keep2]
+            labels = [labels[i] for i in keep2]
+            if (
+                isinstance(masks_t, torch.Tensor)
+                and masks_t.ndim == 3
+                and len(keep2) > 0
+                and int(masks_t.shape[0]) > int(max(keep2))
+            ):
+                masks_t = masks_t[keep2]
+
+    # Optional: further suppress near-duplicate masks for seg.
+    if task == "seg" and isinstance(masks_t, torch.Tensor) and masks_t.ndim == 3 and boxes:
+        try:
+            masks_bin = (masks_t >= float(mask_thresh))
+            keepm = _apply_mask_nms(masks_bin, scores, iou_thresh=float(mask_nms_iou), max_dets=int(max_dets))
+            if keepm:
+                boxes = [boxes[i] for i in keepm]
+                scores = [scores[i] for i in keepm]
+                labels = [labels[i] for i in keepm]
+                if int(masks_t.shape[0]) > int(max(keepm)):
+                    masks_t = masks_t[keepm]
+        except Exception:
+            pass
     mapped_boxes = [unletterbox_xyxy(b, lb) for b in boxes]
 
-    dets = []
+    dets: List[Dict[str, Any]] = []
     for b, s, l in zip(mapped_boxes, scores, labels):
         lid = int(l)
         lname = class_names[lid] if class_names and 0 <= lid < len(class_names) else str(lid)
         dets.append({"bbox": [float(x) for x in b], "score": float(s), "label_id": lid, "label_name": lname})
-    payload = {"image_id": Path(args.image).name, "detections": dets}
 
-    if args.out_json:
-        Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"Wrote JSON: {args.out_json}")
-    else:
-        print(json.dumps(payload))
+    payload: Dict[str, Any] = {
+        "image_id": Path(args.image).name,
+        "task": str(task),
+        "detections": dets,
+    }
+
+    # For seg bundles, we do not inline full masks into JSON by default (too large),
+    # but we do mark their presence and optionally write mask PNGs to disk.
+    if task == "seg" and isinstance(masks_t, torch.Tensor):
+        payload["masks_present"] = True
+        payload["mask_threshold"] = float(mask_thresh)
+        payload["mask_alpha"] = float(mask_alpha)
+
+    out_json_path = str(args.out_json) if args.out_json else None
 
     if args.out_image:
         out_img = orig
         if task == "seg" and isinstance(masks_t, torch.Tensor):
             masks_np = unletterbox_masks(masks_t, lb=lb, out_w=int(orig.width), out_h=int(orig.height), mask_thresh=float(mask_thresh))
             out_img = overlay_masks_pil(out_img, masks_np, labels, alpha=float(mask_alpha))
-        out_img = draw_boxes_pil(out_img, mapped_boxes, scores, labels, class_names)
+            if args.out_masks_dir:
+                out_masks_dir = Path(args.out_masks_dir).expanduser().resolve()
+                out_masks_dir.mkdir(parents=True, exist_ok=True)
+                # Write masks as 8-bit PNG (0/255). One file per kept detection.
+                for i, m in enumerate(masks_np):
+                    mp = (np.asarray(m).astype(np.uint8) * 255)
+                    Image.fromarray(mp).save(out_masks_dir / f"mask_{i:04d}.png")
+                    if i < len(dets):
+                        dets[i]["mask_path"] = str((out_masks_dir / f"mask_{i:04d}.png").as_posix())
+                payload["mask_format"] = "png"
+
+        # Default visualization: seg = masks only, detect = boxes.
+        if args.no_boxes:
+            draw_boxes = False
+        elif args.boxes:
+            draw_boxes = True
+        else:
+            draw_boxes = (task != "seg")
+
+        if draw_boxes:
+            out_img = draw_boxes_pil(out_img, mapped_boxes, scores, labels, class_names)
         Path(args.out_image).parent.mkdir(parents=True, exist_ok=True)
         out_img.save(args.out_image)
         print(f"Wrote overlay: {args.out_image}")
+
+    if out_json_path:
+        Path(out_json_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_json_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote JSON: {out_json_path}")
+    else:
+        print(json.dumps(payload))
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
