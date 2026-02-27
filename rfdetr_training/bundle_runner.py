@@ -624,6 +624,23 @@ def main() -> int:
     out_json_path = str(args.out_json) if args.out_json else None
 
     if args.out_image:
+        try:
+            out_image_path = Path(args.out_image)
+            if out_json_path and str(out_image_path) == str(out_json_path):
+                raise SystemExit("--out-image and --out-json point to the same path; pass a real image path (e.g. out.jpg).")
+            ext = out_image_path.suffix.lower()
+            if ext in (".json",):
+                raise SystemExit(f"--out-image must be an image path (e.g. out.jpg/out.png); got: {out_image_path}")
+            if ext and ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"):
+                raise SystemExit(
+                    f"--out-image has an unknown/unsupported extension {ext!r}. Use .png or .jpg (recommended)."
+                )
+        except SystemExit:
+            raise
+        except Exception:
+            # best-effort; let PIL error if needed
+            pass
+
         out_img = orig
         if task == "seg" and isinstance(masks_t, torch.Tensor):
             masks_np = unletterbox_masks(masks_t, lb=lb, out_w=int(orig.width), out_h=int(orig.height), mask_thresh=float(mask_thresh))

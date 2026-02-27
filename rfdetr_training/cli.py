@@ -137,6 +137,25 @@ def build_parser() -> argparse.ArgumentParser:
     bd.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     bd.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
     bd.add_argument("--checkpoint-key", default=None, help="Explicit key inside checkpoint that contains state_dict")
+    pc = bd.add_mutually_exclusive_group()
+    pc.add_argument(
+        "--portable-checkpoint",
+        dest="portable_checkpoint",
+        action="store_true",
+        default=True,
+        help="Write a weights-only (tensor-only state_dict) checkpoint into the bundle (recommended). Default: enabled.",
+    )
+    pc.add_argument(
+        "--no-portable-checkpoint",
+        dest="portable_checkpoint",
+        action="store_false",
+        help="Copy the checkpoint verbatim into the bundle (may require unsafe torch.load weights_only=False on some PyTorch versions).",
+    )
+    bd.add_argument(
+        "--include-raw-checkpoint",
+        action="store_true",
+        help="Also store the original checkpoint as checkpoint_raw.pth (debugging/trusted only).",
+    )
     bd.add_argument(
         "--strict",
         dest="strict",
@@ -747,6 +766,8 @@ def main(argv: List[str] | None = None) -> int:
             strict=bool(args.strict),
             fp16=bool(args.fp16),
             workspace_mb=int(args.workspace_mb),
+            portable_checkpoint=bool(args.portable_checkpoint),
+            include_raw_checkpoint=bool(args.include_raw_checkpoint),
             make_zip=bool(args.zip),
             overwrite=bool(args.overwrite),
         )

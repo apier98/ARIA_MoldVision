@@ -194,6 +194,45 @@ def _write_deployment_bundle(out_dir: Path, dataset_dir: Path, cfg: TrainConfig,
         return
 
 
+def _try_write_portable_checkpoint(out_dir: Path, *, checkpoint_key: Optional[str]) -> None:
+    """Best-effort: write a weights-only checkpoint next to training outputs."""
+    try:
+        out_dir = out_dir.expanduser().resolve()
+    except Exception:
+        return
+
+    # Prefer "best" checkpoints when present.
+    candidates = [
+        out_dir / "checkpoint_best_total.pth",
+        out_dir / "checkpoint_best_ema.pth",
+        out_dir / "checkpoint_best_regular.pth",
+        out_dir / "checkpoint.pth",
+    ]
+    src = next((p for p in candidates if p.exists()), None)
+    if src is None:
+        return
+
+    dst = out_dir / "checkpoint_portable.pth"
+    try:
+        import torch  # type: ignore
+
+        from .checkpoints import save_portable_checkpoint
+
+        ok, msg = save_portable_checkpoint(
+            src_path=str(src),
+            dst_path=str(dst),
+            device=torch.device("cpu"),
+            checkpoint_key=checkpoint_key,
+            verbose=False,
+        )
+        if ok:
+            print(f"Note: {msg}")
+        else:
+            print(f"Warning: could not write portable checkpoint ({dst}): {msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not write portable checkpoint ({dst}): {e}", file=sys.stderr)
+
+
 class _PatchedInferenceMode:
     def __init__(self, enabled: bool):
         self.enabled = enabled
@@ -484,5 +523,6 @@ def train(cfg: TrainConfig) -> int:
 
     print(f"Training finished. Outputs in: {out_dir}")
     _write_deployment_bundle(out_dir, dataset_dir, cfg, md)
+    _try_write_portable_checkpoint(out_dir, checkpoint_key=cfg.checkpoint_key)
     _summarize_training_outputs(out_dir)
     return 0

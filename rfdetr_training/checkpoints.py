@@ -90,6 +90,80 @@ def _find_state_dict(ckpt: object, checkpoint_key: Optional[str]) -> Optional[di
     return None
 
 
+def extract_state_dict_from_checkpoint(
+    path: str,
+    *,
+    device: object,
+    checkpoint_key: Optional[str] = None,
+    verbose: bool = False,
+) -> Optional[Dict[str, object]]:
+    """Extract a plain (tensor-only) state_dict from an arbitrary checkpoint.
+
+    This is intended for creating deployment-friendly "weights-only" checkpoints that
+    load cleanly under PyTorch 2.6+ defaults (weights_only=True).
+    """
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
+
+    ckpt = _torch_load(path, map_location=device, verbose=verbose)
+    state = _find_state_dict(ckpt, checkpoint_key)
+    if not isinstance(state, dict):
+        return None
+
+    try:
+        import torch
+    except Exception:
+        return None
+
+    out: Dict[str, object] = {}
+    skipped = 0
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            out[str(k)] = v
+        else:
+            skipped += 1
+
+    if verbose and skipped:
+        print(f"Note: extracted state_dict tensors={len(out)}; skipped_non_tensors={skipped}")
+    return out
+
+
+def save_portable_checkpoint(
+    *,
+    src_path: str,
+    dst_path: str,
+    device: object,
+    checkpoint_key: Optional[str] = None,
+    verbose: bool = False,
+) -> Tuple[bool, str]:
+    """Save a weights-only checkpoint (tensor-only state_dict) at dst_path."""
+    try:
+        import torch
+    except Exception as e:
+        return False, f"torch not importable: {e}"
+
+    state = extract_state_dict_from_checkpoint(
+        src_path,
+        device=device,
+        checkpoint_key=checkpoint_key,
+        verbose=verbose,
+    )
+    if not state:
+        return False, "Could not extract a tensor-only state_dict from checkpoint"
+
+    try:
+        payload: Dict[str, object] = {
+            "format_version": 1,
+            "state_dict": state,
+        }
+        torch.save(payload, dst_path)
+        return True, f"Wrote portable checkpoint: {dst_path}"
+    except Exception as e:
+        return False, f"torch.save failed: {e}"
+
+
 def load_checkpoint_weights(
     model: object,
     path: str,

@@ -389,6 +389,8 @@ def create_bundle(
     strict: bool,
     fp16: bool,
     workspace_mb: int,
+    portable_checkpoint: bool,
+    include_raw_checkpoint: bool,
     make_zip: bool,
     overwrite: bool,
 ) -> BundleResult:
@@ -476,9 +478,44 @@ def create_bundle(
     }
     _write_json(bundle_dir / "postprocess.json", postprocess)
 
-    # Copy weights into bundle.
+    # Write weights into bundle.
     dst_weights = bundle_dir / "checkpoint.pth"
-    shutil.copy2(weights, dst_weights)
+    raw_ckpt_in_bundle = None
+    if include_raw_checkpoint:
+        raw_ckpt_in_bundle = bundle_dir / "checkpoint_raw.pth"
+        try:
+            shutil.copy2(weights, raw_ckpt_in_bundle)
+        except Exception:
+            raw_ckpt_in_bundle = None
+
+    checkpoint_write_mode = "copied"
+    checkpoint_write_message = ""
+    if portable_checkpoint:
+        try:
+            import torch  # type: ignore
+
+            from .checkpoints import save_portable_checkpoint
+
+            ok, msg = save_portable_checkpoint(
+                src_path=str(weights),
+                dst_path=str(dst_weights),
+                device=torch.device("cpu"),
+                checkpoint_key=checkpoint_key,
+                verbose=False,
+            )
+            if ok:
+                checkpoint_write_mode = "portable_state_dict"
+                checkpoint_write_message = msg
+            else:
+                checkpoint_write_mode = "copied_fallback"
+                checkpoint_write_message = msg
+                shutil.copy2(weights, dst_weights)
+        except Exception as e:
+            checkpoint_write_mode = "copied_fallback"
+            checkpoint_write_message = str(e)
+            shutil.copy2(weights, dst_weights)
+    else:
+        shutil.copy2(weights, dst_weights)
 
     # Write a self-contained inference runner.
     runner_path = Path(__file__).with_name("bundle_runner.py")
@@ -527,6 +564,12 @@ def create_bundle(
         "dataset_dir": str(dataset_dir),
         "source_weights": str(weights),
         "bundle_dir": str(bundle_dir),
+        "checkpoint": {
+            "path": str(dst_weights.name),
+            "mode": checkpoint_write_mode,
+            "message": checkpoint_write_message,
+            "raw_checkpoint_path": (str(raw_ckpt_in_bundle.name) if raw_ckpt_in_bundle else None),
+        },
         "files": sorted([p.name for p in bundle_dir.iterdir() if p.is_file()]),
     }
     _write_json(bundle_dir / "bundle_manifest.json", manifest)
