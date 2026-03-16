@@ -104,7 +104,7 @@ After training, you can create a self-contained folder you can copy into another
 
 - Recommended: bundle the portable checkpoint source and let the bundler produce the primary ONNX artifact:
   - `python -m rfdetr_training bundle -d datasets/<UUID> -w datasets/<UUID>/models/checkpoint_portable.pth --zip`
-- To also include a TensorRT engine in the bundle, add `--export tensorrt` (requires `trtexec` on `PATH`).
+- To also include a TensorRT engine in the bundle, add `--export tensorrt` (requires `trtexec` on `PATH`). If TensorRT engine build fails, the bundle now stays usable with ONNX as the primary artifact.
 - If you want to bundle a training checkpoint directly, the bundler will still write a weights-only `checkpoint.pth` fallback by default and also ship `model.onnx`:
   - `python -m rfdetr_training bundle -d datasets/<UUID> -w datasets/<UUID>/models/checkpoint_best_total.pth --zip`
   - Optional: include the original checkpoint as `checkpoint_raw.pth` (trusted/debug only) with `--include-raw-checkpoint`.

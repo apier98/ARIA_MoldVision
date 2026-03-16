@@ -698,6 +698,8 @@ def create_bundle(
 
     onnx_path: Optional[Path] = None
     engine_path: Optional[Path] = None
+    tensorrt_status = "not_requested"
+    tensorrt_message = ""
     for ex in requested_exports:
         fmt = (ex or "").strip().lower()
         if fmt == "onnx":
@@ -721,6 +723,7 @@ def create_bundle(
             onnx_path = res.output_path
 
         if fmt == "tensorrt":
+            tensorrt_status = "requested"
             if onnx_path is None:
                 res = export_onnx(
                     dataset_dir=dataset_dir,
@@ -751,7 +754,13 @@ def create_bundle(
                 workspace_mb=int(workspace_mb),
             )
             if not trt_res.ok:
-                return BundleResult(False, None, f"Bundle created but TensorRT export failed: {trt_res.message}")
+                tensorrt_status = "failed"
+                tensorrt_message = trt_res.message
+                engine_path = None
+                print(f"Warning: TensorRT export failed; keeping ONNX bundle as primary artifact. Reason: {trt_res.message}")
+            else:
+                tensorrt_status = "ok"
+                tensorrt_message = trt_res.message
 
     manifest = {
         "format_version": 2,
@@ -777,6 +786,12 @@ def create_bundle(
             "strict_checkpoint_loading": bool(strict),
             "self_contained_python_runner": True,
             "onnx_is_primary": bool(onnx_path is not None),
+            "tensorrt_status": tensorrt_status,
+        },
+        "tensorrt": {
+            "status": tensorrt_status,
+            "message": tensorrt_message,
+            "engine_path": (str(engine_path.name) if engine_path is not None else None),
         },
         "checkpoint": {
             "path": str(dst_weights.name),
@@ -795,4 +810,9 @@ def create_bundle(
                 if p.is_file():
                     zf.write(p, arcname=str(p.relative_to(bundle_dir)))
 
-    return BundleResult(True, bundle_dir, f"Created bundle: {bundle_dir}")
+    message = f"Created bundle: {bundle_dir}"
+    if tensorrt_status == "ok":
+        message += " (TensorRT engine included)"
+    elif tensorrt_status == "failed":
+        message += f" (TensorRT export failed; ONNX remains primary: {tensorrt_message})"
+    return BundleResult(True, bundle_dir, message)
