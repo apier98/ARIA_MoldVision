@@ -218,37 +218,28 @@ def parse_model_output_detr(
     if logits0.ndim != 2 or boxes0.ndim != 2 or boxes0.shape[-1] != 4:
         return [], [], [], None
 
-    # Some models use a "no-object" class (softmax over C+1), while others emit
-    # per-class logits without a background (often sigmoid over C).
-    if int(logits0.shape[-1]) == 1:
-        probs = _sigmoid_stable(logits0)
-        scores_t = probs[:, 0]
-        labels_t = np.zeros((scores_t.shape[0],), dtype=np.int64)
-    else:
-        logits_shift = logits0 - np.max(logits0, axis=-1, keepdims=True)
-        exp_logits = np.exp(logits_shift)
-        probs = exp_logits / np.clip(np.sum(exp_logits, axis=-1, keepdims=True), 1e-12, None)
-        # common DETR convention: last class is "no-object"
-        if probs.shape[-1] > 1:
-            probs = probs[..., :-1]
-        labels_t = np.argmax(probs, axis=-1).astype(np.int64)
-        scores_t = np.max(probs, axis=-1)
-    keep = scores_t >= float(score_thresh)
-    if bool(np.any(keep)):
-        idx = np.nonzero(keep)[0]
-        scores_k = scores_t[idx]
-        labels_k = labels_t[idx]
-        boxes_k = boxes0[idx]
-    else:
+    # Match RF-DETR's official PostProcess: sigmoid over logits, then select
+    # the top-K class/query pairs from the flattened [num_queries, num_classes]
+    # score grid. This is the decode path used during evaluation.
+    probs = _sigmoid_stable(logits0)
+    flat_scores = probs.reshape(-1)
+    if int(flat_scores.size) <= 0:
         return [], [], [], None
-
-    # Sort by score desc and keep topk.
-    order = np.argsort(-scores_k)
-    if int(topk) > 0 and int(order.shape[0]) > int(topk):
-        order = order[: int(topk)]
-    scores_k = scores_k[order]
-    labels_k = labels_k[order]
-    boxes_k = boxes_k[order]
+    k = int(topk) if int(topk) > 0 else int(flat_scores.size)
+    k = min(k, int(flat_scores.size))
+    order = np.argsort(-flat_scores)
+    if int(order.shape[0]) > k:
+        order = order[:k]
+    scores_k = flat_scores[order]
+    keep = scores_k >= float(score_thresh)
+    if not bool(np.any(keep)):
+        return [], [], [], None
+    order = order[keep]
+    scores_k = scores_k[keep]
+    num_classes = int(logits0.shape[-1])
+    box_idxs = (order // num_classes).astype(np.int64)
+    labels_k = (order % num_classes).astype(np.int64)
+    boxes_k = boxes0[box_idxs]
 
     out_boxes: List[List[float]] = []
     out_scores: List[float] = []
@@ -280,7 +271,7 @@ def parse_model_output_detr(
         try:
             m0 = masks[0] if masks.ndim == 4 else masks
             if m0.ndim == 3:
-                m0 = m0[idx][order]
+                m0 = m0[box_idxs]
                 if np.issubdtype(m0.dtype, np.floating):
                     m0 = _sigmoid_stable(m0)
                 out_masks = []

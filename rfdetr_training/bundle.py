@@ -310,20 +310,22 @@ def parse_detections(out: Any, *, model_w: int, model_h: int, score_thresh: floa
             boxes = boxes[0]
         if not isinstance(logits, torch.Tensor) or not isinstance(boxes, torch.Tensor):
             return [], [], []
-        probs = torch.softmax(logits, dim=-1)
-        if probs.shape[-1] > 1:
-            probs = probs[..., :-1]
-        scores_t, labels_t = probs.max(dim=-1)
-        keep = scores_t >= float(score_thresh)
+        probs = logits.sigmoid()
+        flat = probs.reshape(-1)
+        if flat.numel() == 0:
+            return [], [], []
+        k = int(topk) if int(topk) > 0 else int(flat.numel())
+        k = min(k, int(flat.numel()))
+        scores_k, topk_indexes = torch.topk(flat, k, dim=0)
+        keep = scores_k >= float(score_thresh)
         if not bool(keep.any()):
             return [], [], []
-        idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
-        scores_k = scores_t[idx]
-        labels_k = labels_t[idx]
-        boxes_k = boxes[idx]
+        scores_k = scores_k[keep]
+        topk_indexes = topk_indexes[keep]
+        labels_k = topk_indexes % logits.shape[-1]
+        box_idxs = torch.div(topk_indexes, logits.shape[-1], rounding_mode="floor")
+        boxes_k = boxes[box_idxs]
         order = torch.argsort(scores_k, descending=True)
-        if int(topk) > 0 and order.numel() > int(topk):
-            order = order[: int(topk)]
         scores_k = scores_k[order]
         labels_k = labels_k[order]
         boxes_k = boxes_k[order]
@@ -580,7 +582,7 @@ def create_bundle(
         "mask_nms_iou_threshold_default": 0.8,
         "max_dets_default": int(max_dets),
         "min_box_size_default": 1.0,
-        "note": "Postprocess: decode DETR raw outputs (pred_logits/pred_boxes) using softmax (drop last no-object class) when logits have C+1 dims, otherwise sigmoid for 1-class logits. Then filter degenerate boxes and apply optional NMS.",
+        "note": "Postprocess: decode DETR raw outputs with RF-DETR's sigmoid + flattened top-K query/class selection, then filter degenerate boxes and apply optional NMS.",
     }
     _write_json(bundle_dir / "postprocess.json", postprocess)
 

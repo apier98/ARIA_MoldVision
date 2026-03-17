@@ -570,8 +570,6 @@ def main(argv: List[str] | None = None) -> int:
             md_path = dataset_dir / "METADATA.json"
             if md_path.exists():
                 try:
-                    import json
-
                     train_ann = coco_dir / "train" / "_annotations.coco.json"
                     cats = json.loads(train_ann.read_text(encoding="utf-8")).get("categories", []) or []
                     cats = sorted(cats, key=lambda c: int(c.get("id", 0)))

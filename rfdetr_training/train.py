@@ -19,6 +19,7 @@ from .coco import (
 )
 from .datasets import load_metadata
 from .model_factory import instantiate_rfdetr_model
+from .rfdetr_patches import patch_albumentations_empty_masks
 
 
 @dataclass(frozen=True)
@@ -381,6 +382,13 @@ def train(cfg: TrainConfig) -> int:
         print("Failed to instantiate model. Is `rfdetr` installed in this environment?", file=sys.stderr)
         print(str(e), file=sys.stderr)
         return 6
+
+    if cfg.task.lower().strip() == "seg":
+        try:
+            if patch_albumentations_empty_masks():
+                print("Note: patched RF-DETR Albumentations wrapper to allow empty-mask/background seg samples.")
+        except Exception as e:
+            print(f"Warning: could not apply RF-DETR empty-mask patch: {e}", file=sys.stderr)
 
     if cfg.pretrained and not cfg.pretrain_weights:
         maybe_dl = getattr(model, "maybe_download_pretrain_weights", None)
