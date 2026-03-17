@@ -21,7 +21,14 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 
-from infer_helpers import instantiate_model, load_checkpoint_weights, parse_model_output, detections_to_json
+from infer_helpers import (
+    detect_model_size_from_checkpoint,
+    instantiate_model,
+    load_checkpoint_weights,
+    parse_model_output,
+    detections_to_json,
+    read_checkpoint_args,
+)
 from infer_webcam import run_inference
 
 
@@ -83,6 +90,8 @@ def overlay_masks(frame_bgr: np.ndarray, masks: List[np.ndarray], labels: List[i
 
         color = _color_for_id(labels[i] if i < len(labels) else i)
         overlay[mm] = color
+        contours, _ = cv2.findContours((mm.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(frame_bgr, contours, -1, color, thickness=2)
 
     cv2.addWeighted(overlay, float(alpha), frame_bgr, float(1.0 - alpha), 0, dst=frame_bgr)
 
@@ -153,9 +162,23 @@ def main():
     args = parse_args()
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     class_names = load_class_names(args.classes_file) if args.classes_file else []
+    ckpt_args = read_checkpoint_args(args.weights)
+    model_size = args.size
+    if args.task == "seg":
+        detected_size = detect_model_size_from_checkpoint(args.weights, checkpoint_key=args.checkpoint_key)
+        if detected_size:
+            model_size = detected_size
+
+    model_num_classes = args.num_classes
+    if model_num_classes is None and class_names:
+        model_num_classes = int(len(class_names))
+    if model_num_classes is None and ckpt_args is not None:
+        ck_num_classes = getattr(ckpt_args, "num_classes", None)
+        if isinstance(ck_num_classes, int) and ck_num_classes > 0:
+            model_num_classes = int(ck_num_classes)
 
     print("Instantiating model...")
-    model = instantiate_model(size=args.size, num_classes=args.num_classes, task=args.task)
+    model = instantiate_model(size=model_size, num_classes=model_num_classes, task=args.task)
 
     ok, replacement = load_checkpoint_weights(model, args.weights, device, checkpoint_key=args.checkpoint_key, allow_replace_model=args.use_checkpoint_model, verbose=args.verbose)
     if not ok and replacement is None:
@@ -172,6 +195,12 @@ def main():
     try:
         if hasattr(model, "eval"):
             model.eval()
+    except Exception:
+        pass
+    try:
+        optimize = getattr(model, "optimize_for_inference", None)
+        if callable(optimize):
+            optimize(compile=False, batch_size=1)
     except Exception:
         pass
 
