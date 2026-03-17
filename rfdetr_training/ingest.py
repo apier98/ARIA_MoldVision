@@ -100,6 +100,20 @@ def _count_split_items(ann_path: Path) -> Tuple[int, int]:
     return len(images), len(annotations)
 
 
+def _find_raw_images(raw_dir: Path, images_ext: List[str]) -> List[Path]:
+    found: List[Path] = []
+    seen: Set[Path] = set()
+    for ext in images_ext:
+        for pattern in (f"*.{ext}", f"*.{ext.upper()}"):
+            for path in raw_dir.rglob(pattern):
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                found.append(path)
+    return found
+
+
 def ingest_labels_inbox(
     *,
     dataset_dir: Path,
@@ -234,11 +248,8 @@ def ingest_labels_inbox(
     # map raw images by stem
     raw_dir = dataset_dir / "raw"
     raw_images = {}
-    for ext in images_ext:
-        for p in raw_dir.rglob(f"*.{ext}"):
-            raw_images[p.stem] = p
-        for p in raw_dir.rglob(f"*.{ext.upper()}"):
-            raw_images[p.stem] = p
+    for p in _find_raw_images(raw_dir, images_ext):
+        raw_images[p.stem] = p
 
     tmp_yolo_dir = exports_tmp / "yolo_labels"
     tmp_coco_dir = exports_tmp / "yolo_to_coco"
@@ -309,10 +320,7 @@ def ingest_labels_inbox(
     # 3) Include remaining raw images as background (empty annotations) if requested.
     if include_background:
         raw_dir = dataset_dir / "raw"
-        raw_images: List[Path] = []
-        for ext in images_ext:
-            raw_images.extend(list(raw_dir.rglob(f"*.{ext}")))
-            raw_images.extend(list(raw_dir.rglob(f"*.{ext.upper()}")))
+        raw_images = _find_raw_images(raw_dir, images_ext)
 
         remaining = []
         for p in raw_images:

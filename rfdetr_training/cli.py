@@ -658,12 +658,6 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.cmd == "dataset" and args.dataset_cmd == "ingest":
         exts = [e.strip().lower() for e in args.images_ext.split(",") if e.strip()]
-        if str(args.yolo_task).strip().lower() == "seg" and bool(args.include_background):
-            print(
-                "Note: include-background is enabled. Segmentation training can crash if an image has 0 masks "
-                "('masks cannot be empty'). Consider `--no-include-background` for seg datasets.",
-                file=sys.stderr,
-            )
         res = ingest_labels_inbox(
             dataset_dir=Path(args.dataset_dir),
             train_ratio=float(args.train_ratio),

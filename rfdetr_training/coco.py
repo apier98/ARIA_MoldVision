@@ -229,8 +229,9 @@ def validate_coco_split(
                 seg_invalid_count += 1
 
     if task == "seg":
-        # RF-DETR's seg training pipeline (via Albumentations) can crash if an image yields an empty masks list.
-        # Background images (0 annotations) are fine for detection, but typically not for seg.
+        # Background-only segmentation images are allowed, but still worth surfacing
+        # because they contribute no mask supervision and older RF-DETR/Albumentations
+        # stacks could crash on empty mask lists.
         empty_mask_images: List[str] = []
         for iid in image_ids:
             if seg_valid_mask_anns_by_image.get(iid, 0) <= 0:
@@ -239,10 +240,10 @@ def validate_coco_split(
 
         if empty_mask_images:
             preview = ", ".join(empty_mask_images[:10]) + ("..." if len(empty_mask_images) > 10 else "")
-            errors.append(
+            warnings.append(
                 f"{ann_path}: task=seg but {len(empty_mask_images)} images have 0 valid masks "
-                f"(example: {preview}). This will crash training with 'masks cannot be empty'. "
-                "Remove background images for seg or run `python -m rfdetr_training dataset prune-empty-masks -d <DATASET_DIR> --split train|valid`."
+                f"(example: {preview}). Background-only images are allowed, but they do not contribute "
+                "mask supervision."
             )
 
     if task == "seg" and len(anns) > 0 and seg_nonempty_count == 0:
