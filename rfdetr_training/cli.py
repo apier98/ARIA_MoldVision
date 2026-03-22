@@ -14,6 +14,7 @@ from .coco import (
     prune_empty_masks_in_split,
     prune_too_small_masks_in_split,
     reset_coco_dir,
+    subsample_coco_split,
     validate_coco_split,
 )
 from .coco_merge import merge_coco_into_split
@@ -277,6 +278,15 @@ def build_parser() -> argparse.ArgumentParser:
     ds_reset = ds_sub.add_parser("reset-coco", help="Reset coco/ splits to empty (backs up existing coco/)")
     ds_reset.add_argument("--dataset-dir", "-d", required=True)
     ds_reset.add_argument("--no-backup", action="store_true", help="Do not move existing coco/ to a backup folder")
+
+    ds_subsample = ds_sub.add_parser("subsample", help="Subsample a COCO split ensuring class representation and proportional background images")
+    ds_subsample.add_argument("--dataset-dir", "-d", required=True)
+    ds_subsample.add_argument("--split", choices=["train", "valid", "test"], required=True)
+    ds_subsample.add_argument("--fraction", type=float, default=None, help="Fraction of images to keep (e.g., 0.25)")
+    ds_subsample.add_argument("--max-images", type=int, default=None, help="Maximum number of images to keep")
+    ds_subsample.add_argument("--min-instances", type=int, default=1, help="Minimum instances per class to keep")
+    ds_subsample.add_argument("--seed", type=int, default=42, help="Random seed")
+    ds_subsample.add_argument("--dry-run", action="store_true")
 
     ds_imp = ds_sub.add_parser("import-coco", help="Import/merge an external COCO JSON (and images) into this dataset split")
     ds_imp.add_argument("--dataset-dir", "-d", required=True)
@@ -611,6 +621,25 @@ def main(argv: List[str] | None = None) -> int:
             print(f"Error: {msg}", file=sys.stderr)
             return 2
         print(msg)
+        return 0
+
+    if args.cmd == "dataset" and args.dataset_cmd == "subsample":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        coco_dir = dataset_dir / "coco"
+        res = subsample_coco_split(
+            coco_dir / args.split,
+            fraction=args.fraction,
+            max_images=args.max_images,
+            min_instances_per_class=args.min_instances,
+            seed=args.seed,
+            dry_run=bool(args.dry_run),
+        )
+        if not res.ok:
+            print(f"Error: {res.message}", file=sys.stderr)
+            return 2
+        print(res.message)
+        if res.backup_path is not None:
+            print(f"Backup saved to: {res.backup_path}")
         return 0
 
     if args.cmd == "dataset" and args.dataset_cmd == "import-coco":

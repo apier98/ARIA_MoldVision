@@ -8,6 +8,7 @@ Core (supported) CLI:
 - Create dataset folders (UUID layout)
 - Convert YOLO → COCO (detect or seg)
 - Validate COCO splits before training
+- Subsample COCO splits (stratified by class + proportional background)
 - Normalize COCO category ids to contiguous `0..N-1` (fixes common training issues)
 - Train RF-DETR models (detect or seg)
 - Export trained models to ONNX (and optionally build TensorRT engines)
@@ -66,6 +67,10 @@ If you see warnings about 1-indexed category ids or holes, normalize ids (create
 If you see duplicated class names / wrong `num_classes`, align COCO categories to `METADATA.json`:
 
 - `python -m rfdetr_training dataset align-metadata -d datasets/<UUID>`
+
+If you have a very large dataset and want to run quick experiments, you can subsample a split (this utility guarantees that at least one instance of every class is kept and preserves the original background image proportion):
+
+- `python -m rfdetr_training dataset subsample -d datasets/<UUID> --split train --fraction 0.2`
 
 5) Train:
 

@@ -770,3 +770,162 @@ def align_coco_categories_to_metadata(ann_path: Path, *, class_names: List[str],
     coco["annotations"] = anns
     ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
     return True, f"Aligned categories to METADATA.json for: {ann_path} (remapped {remapped} annotations)"
+
+
+def subsample_coco_split(
+    split_dir: Path,
+    *,
+    fraction: Optional[float] = None,
+    max_images: Optional[int] = None,
+    min_instances_per_class: int = 1,
+    seed: int = 42,
+    dry_run: bool = False
+) -> CocoPruneResult:
+    """Subsample a COCO split ensuring class representation and proportional background images."""
+    import random
+    from collections import defaultdict
+
+    ann_path = split_dir / "_annotations.coco.json"
+    if not ann_path.exists():
+        return CocoPruneResult(False, message=f"Missing: {ann_path}")
+
+    try:
+        coco = _load_json(ann_path)
+    except Exception as e:
+        return CocoPruneResult(False, message=f"Failed to parse {ann_path}: {e}")
+
+    images = coco.get("images", []) or []
+    anns = coco.get("annotations", []) or []
+    cats = coco.get("categories", []) or []
+    
+    if not images:
+        return CocoPruneResult(False, message=f"No images found in {ann_path}")
+
+    total_imgs = len(images)
+    
+    if max_images is not None:
+        target_count = max(1, min(max_images, total_imgs))
+    elif fraction is not None:
+        target_count = max(1, min(int(total_imgs * fraction), total_imgs))
+    else:
+        return CocoPruneResult(False, message="Must specify either fraction or max_images")
+
+    if target_count == total_imgs:
+        return CocoPruneResult(True, message="Target count equals total images, no subsampling needed.")
+
+    rng = random.Random(seed)
+
+    # 1. Initialization & Profiling
+    img_id_to_cats = defaultdict(set)
+    img_id_to_ann_count = defaultdict(int)
+    for a in anns:
+        try:
+            iid = int(a.get("image_id"))
+            cid = int(a.get("category_id"))
+            img_id_to_cats[iid].add(cid)
+            img_id_to_ann_count[iid] += 1
+        except Exception:
+            continue
+
+    all_image_ids = set()
+    for im in images:
+        try:
+            all_image_ids.add(int(im.get("id")))
+        except Exception:
+            pass
+
+    background_img_ids = [iid for iid in all_image_ids if img_id_to_ann_count.get(iid, 0) == 0]
+    labeled_img_ids = [iid for iid in all_image_ids if img_id_to_ann_count.get(iid, 0) > 0]
+
+    # Calculate frequencies
+    cat_freq = defaultdict(int)
+    cat_to_imgs = defaultdict(list)
+    for iid in labeled_img_ids:
+        for cid in img_id_to_cats[iid]:
+            cat_freq[cid] += 1
+            cat_to_imgs[cid].append(iid)
+
+    # Sort categories by rarity
+    sorted_cats = sorted(cat_freq.keys(), key=lambda c: cat_freq[c])
+
+    selected_image_ids: Set[int] = set()
+
+    # 2. Phase 1: Class Guarantee (Stratified Greedy Selection)
+    for cid in sorted_cats:
+        # Check current representation of this class
+        current_count = sum(1 for iid in selected_image_ids if cid in img_id_to_cats[iid])
+        
+        if current_count < min_instances_per_class:
+            needed = min_instances_per_class - current_count
+            available = [iid for iid in cat_to_imgs[cid] if iid not in selected_image_ids]
+            # Shuffle to avoid always picking the same images for a class
+            rng.shuffle(available)
+            for iid in available[:needed]:
+                selected_image_ids.add(iid)
+
+    # Calculate remaining slots after class guarantee
+    # Note: Phase 1 might exceed target_count for extremely small subsets, 
+    # but we prioritize class guarantee over absolute subset size.
+
+    # 3. Phase 2: Background Proportionality
+    orig_bg_ratio = len(background_img_ids) / total_imgs if total_imgs > 0 else 0.0
+    target_bg_count = int(target_count * orig_bg_ratio)
+    
+    current_bg_count = len(selected_image_ids.intersection(set(background_img_ids)))
+    bg_needed = max(0, target_bg_count - current_bg_count)
+    
+    available_bg = [iid for iid in background_img_ids if iid not in selected_image_ids]
+    rng.shuffle(available_bg)
+    
+    for iid in available_bg[:bg_needed]:
+        selected_image_ids.add(iid)
+
+    # 4. Phase 3: Random Fill
+    slots_left = target_count - len(selected_image_ids)
+    if slots_left > 0:
+        available_any = [iid for iid in all_image_ids if iid not in selected_image_ids]
+        rng.shuffle(available_any)
+        for iid in available_any[:slots_left]:
+            selected_image_ids.add(iid)
+
+    # 5. Construct & Save
+    kept_images = [im for im in images if int(im.get("id", -1)) in selected_image_ids]
+    kept_anns = [a for a in anns if int(a.get("image_id", -1)) in selected_image_ids]
+
+    removed_images = len(images) - len(kept_images)
+    removed_annotations = len(anns) - len(kept_anns)
+
+    if dry_run:
+        return CocoPruneResult(
+            True,
+            removed_images=removed_images,
+            removed_annotations=removed_annotations,
+            backup_path=None,
+            message=(
+                f"{split_dir.name}: would keep {len(kept_images)}/{total_imgs} images "
+                f"and {len(kept_anns)}/{len(anns)} annotations (dry-run)"
+            ),
+        )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = ann_path.with_name(f"_annotations.coco.backup_subsample_{ts}.json")
+    try:
+        shutil.copy2(str(ann_path), str(backup_path))
+    except Exception:
+        backup_path = None
+
+    coco["images"] = kept_images
+    coco["annotations"] = kept_anns
+    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+
+    return CocoPruneResult(
+        True,
+        removed_images=removed_images,
+        removed_annotations=removed_annotations,
+        backup_path=backup_path,
+        message=(
+            f"{split_dir.name}: subsampled to {len(kept_images)} images "
+            f"(-{removed_images} images, -{removed_annotations} annotations)"
+        ),
+    )
+
