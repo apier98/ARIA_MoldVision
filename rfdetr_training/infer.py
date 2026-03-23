@@ -51,6 +51,47 @@ def _adjust_dims_to_patch_size(*, target_h: int, target_w: int, patch_size: Opti
     return adj_h, adj_w
 
 
+def _resolve_onnx_input_dtype(input_meta: Any, *, fallback_dtype: Optional[str] = None):
+    import numpy as np
+
+    type_name = getattr(input_meta, "type", input_meta)
+    type_name = str(type_name).strip().lower() if type_name is not None else ""
+    normalized = type_name
+    if normalized.startswith("tensor(") and normalized.endswith(")"):
+        normalized = normalized[7:-1].strip()
+    if normalized.startswith("seq(") and normalized.endswith(")"):
+        normalized = normalized[4:-1].strip()
+    if normalized.startswith("optional(") and normalized.endswith(")"):
+        normalized = normalized[9:-1].strip()
+
+    dtype_map = {
+        "float16": np.float16,
+        "float": np.float32,
+        "float32": np.float32,
+        "double": np.float64,
+        "float64": np.float64,
+        "bfloat16": np.float32,
+        "int8": np.int8,
+        "uint8": np.uint8,
+        "int16": np.int16,
+        "uint16": np.uint16,
+        "int32": np.int32,
+        "uint32": np.uint32,
+        "int64": np.int64,
+        "uint64": np.uint64,
+        "bool": np.bool_,
+    }
+    if normalized in dtype_map:
+        return np.dtype(dtype_map[normalized])
+
+    if fallback_dtype:
+        fallback = str(fallback_dtype).strip().lower()
+        if fallback in dtype_map:
+            return np.dtype(dtype_map[fallback])
+
+    return np.dtype(np.float32)
+
+
 def _run_tensorrt_inference(
     *,
     bundle_dir: Path,
@@ -320,6 +361,11 @@ def _run_onnx_inference(
     arr = np.asarray(pil_in, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))[None, ...]
     arr = normalize_image_nchw(arr).astype(np.float32, copy=False)
+
+    # Cast to match model input type (e.g. float16)
+    input_meta = inputs[0]
+    target_dtype = _resolve_onnx_input_dtype(input_meta, fallback_dtype=pre_cfg.get("input_dtype"))
+    arr = arr.astype(target_dtype, copy=False)
 
     try:
         output_names = [out.name for out in session.get_outputs()]
@@ -592,6 +638,7 @@ class InferenceEngine:
     def _init_backend(self, checkpoint_key, use_checkpoint_model, strict):
         engine_path = self.bundle_dir / "model.engine"
         quantized_onnx_path = self.bundle_dir / "model_quantized.onnx"
+        fp16_onnx_path = self.bundle_dir / "model_fp16.onnx"
         onnx_path = self.bundle_dir / "model.onnx"
 
         # 1. Try TensorRT
@@ -617,6 +664,8 @@ class InferenceEngine:
         if self.backend in {"auto", "onnx"}:
             if quantized_onnx_path.exists():
                 cand_onnx = quantized_onnx_path
+            elif fp16_onnx_path.exists():
+                cand_onnx = fp16_onnx_path
             elif onnx_path.exists():
                 cand_onnx = onnx_path
 
@@ -792,6 +841,9 @@ class InferenceEngine:
         arr = np.asarray(pil_in, dtype=np.float32) / 255.0
         arr = np.transpose(arr, (2, 0, 1))[None, ...].astype(np.float32)
         arr = normalize_image_nchw(arr).astype(np.float32, copy=False)
+
+        target_dtype = _resolve_onnx_input_dtype(inputs[0], fallback_dtype=self.pre_cfg.get("input_dtype"))
+        arr = arr.astype(target_dtype, copy=False)
 
         output_names = [out.name for out in self.session.get_outputs()]
         raw_outputs = self.session.run(output_names, {inputs[0].name: arr})

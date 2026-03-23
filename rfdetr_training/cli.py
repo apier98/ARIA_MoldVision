@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Model size preset. Default: auto (from datasets/<UUID>/models/model_config.json). Ignored if using checkpoint model.",
     )
-    ex.add_argument("--format", choices=["onnx", "tensorrt", "onnx_quantized"], default="onnx")
+    ex.add_argument("--format", choices=["onnx", "tensorrt", "onnx_quantized", "onnx_fp16"], default="onnx")
     ex.add_argument("--output", "-o", default=None, help="Output path (.onnx or .engine). Default: datasets/<UUID>/exports/")
     ex.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     ex.add_argument("--height", type=int, default=640)
@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--export",
         action="append",
         default=None,
-        choices=["onnx", "tensorrt", "onnx_quantized"],
+        choices=["onnx", "tensorrt", "onnx_quantized", "onnx_fp16"],
         help="Extra exported formats to include. Default behavior already ships ONNX as the primary bundle artifact.",
     )
     bd.add_argument("--opset", type=int, default=18, help="ONNX opset")
@@ -756,7 +756,7 @@ def main(argv: List[str] | None = None) -> int:
         task = str(args.task or trained_model_cfg.get("task") or "detect").strip().lower()
         size = str(args.size or trained_model_cfg.get("size") or "nano").strip().lower()
 
-        if args.format in {"onnx", "onnx_quantized"}:
+        if args.format in {"onnx", "onnx_quantized", "onnx_fp16"}:
             res = export_onnx(
                 dataset_dir=dataset_dir,
                 weights=weights,
@@ -771,6 +771,7 @@ def main(argv: List[str] | None = None) -> int:
                 use_checkpoint_model=bool(args.use_checkpoint_model),
                 checkpoint_key=args.checkpoint_key,
                 strict=bool(args.strict),
+                half=(args.format == "onnx_fp16" or args.fp16),
             )
             if not res.ok:
                 print(f"Error: {res.message}", file=sys.stderr)

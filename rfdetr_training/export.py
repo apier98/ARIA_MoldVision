@@ -162,6 +162,7 @@ def export_onnx(
     checkpoint_key: Optional[str],
     strict: bool,
     batchless_input: bool = False,
+    half: bool = False,
 ) -> ExportResult:
     try:
         import torch
@@ -355,11 +356,16 @@ def export_onnx(
             return tensors
 
     wrapper = OnnxWrapper(module, want_masks=want_masks, batchless_input=bool(batchless_input)).to(torch_device).eval()
+    if half:
+        wrapper.half()
 
     if batchless_input:
         dummy = torch.randn(3, int(height), int(width), device=torch_device)
     else:
         dummy = torch.randn(1, 3, int(height), int(width), device=torch_device)
+    
+    if half:
+        dummy = dummy.half()
 
     # output paths
     if output is None:

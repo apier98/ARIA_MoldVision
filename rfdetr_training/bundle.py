@@ -32,6 +32,26 @@ def _write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
 
+def _read_onnx_input_dtype(onnx_path: Path) -> Optional[str]:
+    try:
+        import onnx  # type: ignore
+    except ImportError:
+        return None
+
+    try:
+        model = onnx.load(str(onnx_path), load_external_data=False)
+        if not model.graph.input:
+            return None
+        tensor_type = model.graph.input[0].type.tensor_type
+        elem_type = int(tensor_type.elem_type)
+        name = onnx.TensorProto.DataType.Name(elem_type)
+        if not name:
+            return None
+        return str(name).strip().lower()
+    except Exception:
+        return None
+
+
 def _default_bundle_dir(dataset_dir: Path, *, weights: Path) -> Path:
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
     return dataset_dir / "deploy" / f"{_safe_name(weights.stem)}_{stamp}"
@@ -716,7 +736,7 @@ def create_bundle(
                 "- `--out-video path`: Save the annotated video to a file.",
                 "",
                 "### Notes:",
-                "- Primary shipped model format is ONNX (`model.onnx`). If `model_quantized.onnx` is present, it will be preferred by default.",
+                "- Primary shipped model format is ONNX (`model.onnx`). If `model_quantized.onnx` or `model_fp16.onnx` is present, it will be preferred by default.",
                 "- If `model.engine` is also present and TensorRT runtime is available, `infer.py` will try TensorRT first and fall back to ONNX automatically.",
                 "- Preprocess keeps aspect ratio (letterbox) per `preprocess.json`.",
                 "- This bundle includes a vendored copy of the `rfdetr_training` package so `infer.py` can run without installing this repo.",
@@ -733,6 +753,7 @@ def create_bundle(
 
     onnx_path: Optional[Path] = None
     quantized_path: Optional[Path] = None
+    fp16_path: Optional[Path] = None
     engine_path: Optional[Path] = None
     tensorrt_status = "not_requested"
     tensorrt_message = ""
@@ -753,10 +774,32 @@ def create_bundle(
                 use_checkpoint_model=bool(use_checkpoint_model),
                 checkpoint_key=checkpoint_key,
                 strict=bool(strict),
+                half=False,
             )
             if not res.ok or res.output_path is None:
                 return BundleResult(False, None, f"Bundle created but ONNX export failed: {res.message}")
             onnx_path = res.output_path
+
+        if fmt == "onnx_fp16":
+            res = export_onnx(
+                dataset_dir=dataset_dir,
+                weights=weights,
+                task=task_final,
+                size=size_final,
+                output=(bundle_dir / "model_fp16.onnx"),
+                device=device,
+                height=int(h),
+                width=int(w),
+                opset=int(opset),
+                dynamic=bool(dynamic_onnx),
+                use_checkpoint_model=bool(use_checkpoint_model),
+                checkpoint_key=checkpoint_key,
+                strict=bool(strict),
+                half=True,
+            )
+            if not res.ok or res.output_path is None:
+                return BundleResult(False, None, f"Bundle created but ONNX FP16 export failed: {res.message}")
+            fp16_path = res.output_path
 
         if fmt == "onnx_quantized":
             base_onnx = onnx_path
@@ -847,6 +890,17 @@ def create_bundle(
                 tensorrt_status = "ok"
                 tensorrt_message = trt_res.message
 
+    preferred_onnx_path = quantized_path or fp16_path or onnx_path
+    if preferred_onnx_path is not None:
+        detected_input_dtype = _read_onnx_input_dtype(preferred_onnx_path)
+        if detected_input_dtype:
+            preprocess["input_dtype"] = detected_input_dtype
+            preprocess["note"] = (
+                "Input contract: RGB -> float32 0..1 -> ImageNet mean/std normalization -> "
+                f"cast to {detected_input_dtype} for the selected runtime artifact."
+            )
+            _write_json(bundle_dir / "preprocess.json", preprocess)
+
     manifest = {
         "format_version": 2,
         "created_at": datetime.utcnow().isoformat() + "Z",
@@ -855,12 +909,19 @@ def create_bundle(
         "bundle_dir": str(bundle_dir),
         "runtime_versions": runtime_versions,
         "primary_artifact": {
-            "format": "onnx" if (quantized_path or onnx_path) else "pytorch-checkpoint",
-            "path": (str(quantized_path.name) if quantized_path else (str(onnx_path.name) if onnx_path else str(dst_weights.name))),
-            "runtime": ("onnxruntime" if (quantized_path or onnx_path) else "pytorch"),
+            "format": "onnx" if (quantized_path or fp16_path or onnx_path) else "pytorch-checkpoint",
+            "path": (
+                str(quantized_path.name) if quantized_path 
+                else (str(fp16_path.name) if fp16_path 
+                else (str(onnx_path.name) if onnx_path 
+                else str(dst_weights.name)))
+            ),
+            "runtime": ("onnxruntime" if (quantized_path or fp16_path or onnx_path) else "pytorch"),
+            "input_dtype": (preprocess.get("input_dtype") if (quantized_path or fp16_path or onnx_path) else None),
         },
         "artifacts": {
             "onnx_path": (str(onnx_path.name) if onnx_path is not None else None),
+            "onnx_fp16_path": (str(fp16_path.name) if fp16_path is not None else None),
             "onnx_quantized_path": (str(quantized_path.name) if quantized_path is not None else None),
             "tensorrt_engine_path": (str(engine_path.name) if engine_path is not None else None),
             "checkpoint_path": str(dst_weights.name),
@@ -871,7 +932,7 @@ def create_bundle(
             "allow_raw_checkpoint_fallback": bool(allow_raw_checkpoint_fallback),
             "strict_checkpoint_loading": bool(strict),
             "self_contained_python_runner": True,
-            "onnx_is_primary": bool(onnx_path is not None),
+            "onnx_is_primary": bool(onnx_path is not None or quantized_path is not None or fp16_path is not None),
             "tensorrt_status": tensorrt_status,
         },
         "tensorrt": {
