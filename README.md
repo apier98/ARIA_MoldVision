@@ -98,6 +98,13 @@ Export to ONNX:
 - `export` auto-detects `--task` and `--size` from `datasets/<UUID>/models/model_config.json` when available, so trained `seg` checkpoints export without restating the architecture.
 - Tip: export is `--strict` by default (fails fast on mismatched checkpoints). Use `--non-strict` only for debugging.
 
+ONNX Quantization (INT8):
+- Export and quantize in one step: `python -m rfdetr_training export -d datasets/<UUID> -w ... --format onnx_quantized`
+- Quantization uses **static calibration** by default using images from your dataset:
+    - `--calibration-split valid`: Choose which split to use for calibration (default: `valid`).
+    - `--calibration-count 100`: Number of images to use for calibration (default: `100`).
+- If no calibration data is found, it falls back to **dynamic quantization**.
+
 Build a TensorRT engine (requires TensorRT `trtexec` on PATH):
 - `python -m rfdetr_training export -d datasets/<UUID> -w datasets/<UUID>/models/checkpoint_best_total.pth --format tensorrt --fp16`
 
@@ -110,11 +117,14 @@ After training, you can create a self-contained folder you can copy into another
 
 - Recommended: bundle the portable checkpoint source and let the bundler produce the primary ONNX artifact:
   - `python -m rfdetr_training bundle -d datasets/<UUID> -w datasets/<UUID>/models/checkpoint_portable.pth --zip`
+- **Include a quantized INT8 model in the bundle**:
+  - `python -m rfdetr_training bundle -d datasets/<UUID> -w ... --quantize`
+  - This adds `model_quantized.onnx` to the bundle. The `infer.py` runner will prefer the quantized model by default.
 - To also include a TensorRT engine in the bundle, add `--export tensorrt` (requires `trtexec` on `PATH`). If TensorRT engine build fails, the bundle now stays usable with ONNX as the primary artifact.
 - If you want to bundle a training checkpoint directly, the bundler will still write a weights-only `checkpoint.pth` fallback by default and also ship `model.onnx`:
   - `python -m rfdetr_training bundle -d datasets/<UUID> -w datasets/<UUID>/models/checkpoint_best_total.pth --zip`
   - Optional: include the original checkpoint as `checkpoint_raw.pth` (trusted/debug only) with `--include-raw-checkpoint`.
-- If the bundle also contains `model.engine`, `infer.py` now tries TensorRT first, then falls back to ONNX automatically, then PyTorch fallback last.
+- If the bundle also contains `model.engine`, `infer.py` now tries TensorRT first, then falls back to `model_quantized.onnx` (if present), then `model.onnx` automatically, then PyTorch fallback last.
 - You can force a backend with `--backend tensorrt`, `--backend onnx`, or `--backend pytorch`.
 - If weights-only extraction fails, bundle creation now stops by default instead of silently copying the raw checkpoint. Use `--allow-raw-checkpoint-fallback` only for trusted/debug scenarios.
 - Inside the bundle folder, install the primary runtime with `pip install -r requirements.txt`.

@@ -591,6 +591,7 @@ class InferenceEngine:
 
     def _init_backend(self, checkpoint_key, use_checkpoint_model, strict):
         engine_path = self.bundle_dir / "model.engine"
+        quantized_onnx_path = self.bundle_dir / "model_quantized.onnx"
         onnx_path = self.bundle_dir / "model.onnx"
 
         # 1. Try TensorRT
@@ -612,7 +613,14 @@ class InferenceEngine:
                     raise RuntimeError(f"Failed to load TensorRT: {e}")
 
         # 2. Try ONNX
-        if self.backend in {"auto", "onnx"} and onnx_path.exists():
+        cand_onnx = None
+        if self.backend in {"auto", "onnx"}:
+            if quantized_onnx_path.exists():
+                cand_onnx = quantized_onnx_path
+            elif onnx_path.exists():
+                cand_onnx = onnx_path
+
+        if cand_onnx:
             try:
                 import onnxruntime as ort
                 providers = ["CPUExecutionProvider"]
@@ -624,12 +632,12 @@ class InferenceEngine:
                 if wants_cuda and "CUDAExecutionProvider" in available:
                     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
                 
-                self.session = ort.InferenceSession(str(onnx_path), providers=providers)
+                self.session = ort.InferenceSession(str(cand_onnx), providers=providers)
                 self.active_backend = "onnx"
                 return
             except Exception as e:
                 if self.backend == "onnx":
-                    raise RuntimeError(f"Failed to load ONNX: {e}")
+                    raise RuntimeError(f"Failed to load ONNX ({cand_onnx}): {e}")
 
         # 3. Fallback to PyTorch
         try:

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .datasets import load_metadata
-from .export import export_onnx, export_tensorrt_from_onnx
+from .export import export_onnx, export_tensorrt_from_onnx, quantize_onnx
 from .model_factory import instantiate_rfdetr_model
 from .torch_compat import infer_backbone_patch_size, unwrap_torch_module
 
@@ -480,6 +480,9 @@ def create_bundle(
     include_raw_checkpoint: bool,
     make_zip: bool,
     overwrite: bool,
+    quantize: bool = False,
+    calibration_split: str = "valid",
+    calibration_count: int = 100,
 ) -> BundleResult:
     dataset_dir = dataset_dir.expanduser().resolve()
     weights = weights.expanduser().resolve()
@@ -594,6 +597,12 @@ def create_bundle(
     requested_exports = [str(ex).strip().lower() for ex in exports if str(ex).strip()]
     if not requested_exports:
         requested_exports = ["onnx"]
+    if quantize and "onnx_quantized" not in requested_exports:
+        requested_exports.append("onnx_quantized")
+    if "onnx_quantized" in requested_exports and "onnx" not in requested_exports:
+        # We need a base ONNX to quantize, but we might not want it in the final bundle.
+        # This will be handled in the export loop.
+        pass
     if "tensorrt" in requested_exports and "onnx" not in requested_exports:
         requested_exports.insert(0, "onnx")
 
@@ -707,7 +716,8 @@ def create_bundle(
                 "- `--out-video path`: Save the annotated video to a file.",
                 "",
                 "### Notes:",
-                "- Primary shipped model format is ONNX (`model.onnx`). If `model.engine` is also present and TensorRT runtime is available, `infer.py` will try TensorRT first and fall back to ONNX automatically.",
+                "- Primary shipped model format is ONNX (`model.onnx`). If `model_quantized.onnx` is present, it will be preferred by default.",
+                "- If `model.engine` is also present and TensorRT runtime is available, `infer.py` will try TensorRT first and fall back to ONNX automatically.",
                 "- Preprocess keeps aspect ratio (letterbox) per `preprocess.json`.",
                 "- This bundle includes a vendored copy of the `rfdetr_training` package so `infer.py` can run without installing this repo.",
                 "- Install the primary runtime with `pip install -r requirements.txt`.",
@@ -722,6 +732,7 @@ def create_bundle(
     )
 
     onnx_path: Optional[Path] = None
+    quantized_path: Optional[Path] = None
     engine_path: Optional[Path] = None
     tensorrt_status = "not_requested"
     tensorrt_message = ""
@@ -746,6 +757,50 @@ def create_bundle(
             if not res.ok or res.output_path is None:
                 return BundleResult(False, None, f"Bundle created but ONNX export failed: {res.message}")
             onnx_path = res.output_path
+
+        if fmt == "onnx_quantized":
+            base_onnx = onnx_path
+            temp_onnx = None
+            if base_onnx is None:
+                temp_onnx = bundle_dir / "_tmp_model.onnx"
+                res = export_onnx(
+                    dataset_dir=dataset_dir,
+                    weights=weights,
+                    task=task_final,
+                    size=size_final,
+                    output=temp_onnx,
+                    device=device,
+                    height=int(h),
+                    width=int(w),
+                    opset=int(opset),
+                    dynamic=bool(dynamic_onnx),
+                    use_checkpoint_model=bool(use_checkpoint_model),
+                    checkpoint_key=checkpoint_key,
+                    strict=bool(strict),
+                )
+                if not res.ok or res.output_path is None:
+                    return BundleResult(False, None, f"Bundle created but ONNX export (for quantization) failed: {res.message}")
+                base_onnx = res.output_path
+
+            q_res = quantize_onnx(
+                onnx_path=base_onnx,
+                output_path=(bundle_dir / "model_quantized.onnx"),
+                dataset_dir=dataset_dir,
+                calibration_split=calibration_split,
+                calibration_count=calibration_count,
+                height=int(h),
+                width=int(w),
+            )
+            if temp_onnx and temp_onnx.exists():
+                try:
+                    temp_onnx.unlink()
+                except Exception:
+                    pass
+
+            if q_res.ok:
+                quantized_path = q_res.output_path
+            else:
+                return BundleResult(False, None, f"Bundle created but ONNX quantization failed: {q_res.message}")
 
         if fmt == "tensorrt":
             tensorrt_status = "requested"
@@ -800,12 +855,13 @@ def create_bundle(
         "bundle_dir": str(bundle_dir),
         "runtime_versions": runtime_versions,
         "primary_artifact": {
-            "format": "onnx" if onnx_path is not None else "pytorch-checkpoint",
-            "path": (str(onnx_path.name) if onnx_path is not None else str(dst_weights.name)),
-            "runtime": ("onnxruntime" if onnx_path is not None else "pytorch"),
+            "format": "onnx" if (quantized_path or onnx_path) else "pytorch-checkpoint",
+            "path": (str(quantized_path.name) if quantized_path else (str(onnx_path.name) if onnx_path else str(dst_weights.name))),
+            "runtime": ("onnxruntime" if (quantized_path or onnx_path) else "pytorch"),
         },
         "artifacts": {
             "onnx_path": (str(onnx_path.name) if onnx_path is not None else None),
+            "onnx_quantized_path": (str(quantized_path.name) if quantized_path is not None else None),
             "tensorrt_engine_path": (str(engine_path.name) if engine_path is not None else None),
             "checkpoint_path": str(dst_weights.name),
             "raw_checkpoint_path": (str(raw_ckpt_in_bundle.name) if raw_ckpt_in_bundle else None),

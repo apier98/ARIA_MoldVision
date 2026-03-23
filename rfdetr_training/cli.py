@@ -104,13 +104,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Model size preset. Default: auto (from datasets/<UUID>/models/model_config.json). Ignored if using checkpoint model.",
     )
-    ex.add_argument("--format", choices=["onnx", "tensorrt"], default="onnx")
+    ex.add_argument("--format", choices=["onnx", "tensorrt", "onnx_quantized"], default="onnx")
     ex.add_argument("--output", "-o", default=None, help="Output path (.onnx or .engine). Default: datasets/<UUID>/exports/")
     ex.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     ex.add_argument("--height", type=int, default=640)
     ex.add_argument("--width", type=int, default=640)
     ex.add_argument("--opset", type=int, default=18, help="ONNX opset")
     ex.add_argument("--dynamic", action="store_true", help="Dynamic input H/W axes (ONNX only)")
+    ex.add_argument("--quantize", action="store_true", help="Enable ONNX quantization (for --format onnx_quantized)")
+    ex.add_argument("--calibration-split", default="valid", help="Dataset split for quantization calibration")
+    ex.add_argument("--calibration-count", type=int, default=100, help="Number of images for calibration")
     ex.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
     ex.add_argument("--checkpoint-key", default=None, help="Explicit key inside checkpoint that contains state_dict")
     ex.add_argument(
@@ -152,11 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--export",
         action="append",
         default=None,
-        choices=["onnx", "tensorrt"],
+        choices=["onnx", "tensorrt", "onnx_quantized"],
         help="Extra exported formats to include. Default behavior already ships ONNX as the primary bundle artifact.",
     )
     bd.add_argument("--opset", type=int, default=18, help="ONNX opset")
     bd.add_argument("--dynamic", action="store_true", help="ONNX: export dynamic H/W axes")
+    bd.add_argument("--quantize", action="store_true", help="Include quantized ONNX model in bundle")
+    bd.add_argument("--calibration-split", default="valid", help="Dataset split for quantization calibration")
+    bd.add_argument("--calibration-count", type=int, default=100, help="Number of images for calibration")
     bd.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     bd.add_argument("--use-checkpoint-model", action="store_true", help="If checkpoint contains a pickled model, use it (trusted only)")
     bd.add_argument("--checkpoint-key", default=None, help="Explicit key inside checkpoint that contains state_dict")
@@ -750,7 +756,7 @@ def main(argv: List[str] | None = None) -> int:
         task = str(args.task or trained_model_cfg.get("task") or "detect").strip().lower()
         size = str(args.size or trained_model_cfg.get("size") or "nano").strip().lower()
 
-        if args.format == "onnx":
+        if args.format in {"onnx", "onnx_quantized"}:
             res = export_onnx(
                 dataset_dir=dataset_dir,
                 weights=weights,
@@ -769,6 +775,23 @@ def main(argv: List[str] | None = None) -> int:
             if not res.ok:
                 print(f"Error: {res.message}", file=sys.stderr)
                 return 2
+            
+            if args.format == "onnx_quantized" or args.quantize:
+                q_res = quantize_onnx(
+                    onnx_path=res.output_path,
+                    output_path=None, # Auto name
+                    dataset_dir=dataset_dir,
+                    calibration_split=args.calibration_split,
+                    calibration_count=args.calibration_count,
+                    height=int(args.height),
+                    width=int(args.width),
+                )
+                if not q_res.ok:
+                    print(f"Error: {q_res.message}", file=sys.stderr)
+                    return 2
+                print(q_res.message)
+                return 0
+            
             print(res.message)
             return 0
 
@@ -844,6 +867,9 @@ def main(argv: List[str] | None = None) -> int:
             include_raw_checkpoint=bool(args.include_raw_checkpoint),
             make_zip=bool(args.zip),
             overwrite=bool(args.overwrite),
+            quantize=bool(args.quantize),
+            calibration_split=args.calibration_split,
+            calibration_count=int(args.calibration_count),
         )
         if not res.ok:
             print(f"Error: {res.message}", file=sys.stderr)

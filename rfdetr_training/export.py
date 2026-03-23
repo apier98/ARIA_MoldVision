@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .checkpoints import load_checkpoint_weights
 from .datasets import load_metadata
@@ -17,6 +18,62 @@ class ExportResult:
     ok: bool
     output_path: Optional[Path] = None
     message: str = ""
+
+
+def quantize_onnx(
+    *,
+    onnx_path: Path,
+    output_path: Optional[Path] = None,
+    dataset_dir: Optional[Path] = None,
+    calibration_split: str = "valid",
+    calibration_count: int = 100,
+    height: int = 640,
+    width: int = 640,
+) -> ExportResult:
+    """Quantize an existing ONNX model to INT8."""
+    from .quantization import quantize_onnx_model
+
+    onnx_path = onnx_path.expanduser().resolve()
+    if output_path is None:
+        output_path = onnx_path.with_name(onnx_path.stem + "_quantized.onnx")
+    else:
+        output_path = output_path.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    calibration_images: List[Path] = []
+    if dataset_dir:
+        dataset_dir = dataset_dir.expanduser().resolve()
+        split_dir = dataset_dir / "coco" / calibration_split
+        ann_path = split_dir / "_annotations.coco.json"
+        if ann_path.exists():
+            try:
+                coco_data = json.loads(ann_path.read_text(encoding="utf-8"))
+                images = coco_data.get("images", [])
+                # Use a subset for calibration
+                selected = images[: int(calibration_count)]
+                for img_info in selected:
+                    fname = img_info.get("file_name")
+                    if fname:
+                        p = split_dir / fname
+                        if p.exists():
+                            calibration_images.append(p)
+            except Exception as e:
+                print(f"Warning: Failed to load calibration data from {ann_path}: {e}")
+
+    try:
+        ok = quantize_onnx_model(
+            model_path=onnx_path,
+            output_path=output_path,
+            calibration_data=calibration_images,
+            target_h=height,
+            target_w=width,
+            verbose=True,
+        )
+        if ok:
+            return ExportResult(True, output_path, f"Wrote quantized ONNX: {output_path}")
+        return ExportResult(False, None, "Quantization failed (output file not created).")
+    except Exception as e:
+        return ExportResult(False, None, f"Quantization failed: {e}")
 
 
 def _instantiate_model(task: str, size: str, num_classes: Optional[int], pretrain_weights: Optional[str] = None):
