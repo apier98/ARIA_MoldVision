@@ -50,6 +50,33 @@ def overlay_masks_pil(base: Image.Image, masks: List[np.ndarray], labels: List[i
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 
+def overlay_masks_visible(frame_bgr: np.ndarray, masks: List[Any], labels: List[int], alpha: float = 0.45) -> None:
+    if not masks:
+        return
+    try:
+        import cv2
+    except ImportError:
+        return
+
+    h, w = frame_bgr.shape[:2]
+    overlay = frame_bgr.copy()
+    for i, m in enumerate(masks):
+        if m is None:
+            continue
+        mm = np.asarray(m).astype(bool)
+        if mm.ndim != 2:
+            continue
+        if mm.shape[0] != h or mm.shape[1] != w:
+            mm_u8 = mm.astype(np.uint8) * 255
+            mm_u8 = cv2.resize(mm_u8, (w, h), interpolation=cv2.INTER_NEAREST)
+            mm = mm_u8 > 127
+        color = _color_for_id(labels[i] if i < len(labels) else i)
+        overlay[mm] = color
+        contours, _ = cv2.findContours((mm.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(frame_bgr, contours, -1, color, 2)
+    cv2.addWeighted(overlay, float(alpha), frame_bgr, float(1.0 - alpha), 0, dst=frame_bgr)
+
+
 def draw_boxes_pil(base: Image.Image, boxes: List[List[float]], scores: List[float], labels: List[int], class_names: List[str]) -> Image.Image:
     img = base.copy()
     draw = ImageDraw.Draw(img)
@@ -279,7 +306,6 @@ def main() -> int:
         return res, (boxes, scores, labels, masks)
 
     if args.image:
-        import numpy as np
         img_path = Path(args.image)
         orig = Image.open(img_path).convert("RGB")
         frame_np = np.asarray(orig)[:, :, ::-1] # BGR for consistency
@@ -354,10 +380,7 @@ def main() -> int:
                 # Draw results on frame for display/saving
                 disp = frame.copy()
                 if masks:
-                    # Reuse overlay_masks_pil but convert to/from BGR
-                    pil_frame = Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
-                    pil_ov = overlay_masks_pil(pil_frame, [np.asarray(m) for m in masks], labels, alpha=float(mask_alpha))
-                    disp = cv2.cvtColor(np.asarray(pil_ov), cv2.COLOR_RGB2BGR)
+                    overlay_masks_visible(disp, masks, labels, alpha=float(mask_alpha))
                 
                 draw_boxes = bool(args.boxes) or (not bool(args.no_boxes) and task != "seg")
                 if draw_boxes:
