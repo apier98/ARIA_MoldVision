@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .model_factory import instantiate_rfdetr_model
 from .deploy import (
@@ -539,6 +539,322 @@ def _run_pytorch_inference(
     return InferResult(True, payload, "ok:pytorch", boxes=boxes, scores=scores, labels=labels, masks=masks)
 
 
+class InferenceEngine:
+    def __init__(
+        self,
+        *,
+        bundle_dir: Path,
+        weights_path: Optional[Path] = None,
+        device: Optional[str] = None,
+        score_thresh: Optional[float] = None,
+        mask_thresh: Optional[float] = None,
+        checkpoint_key: Optional[str] = None,
+        use_checkpoint_model: bool = False,
+        strict: bool = False,
+        backend: str = "auto",
+        topk: Optional[int] = None,
+    ):
+        self.bundle_dir = bundle_dir.expanduser().resolve()
+        self.cfg = load_bundle_config(self.bundle_dir)
+        self.model_cfg = self.cfg.get("model_config.json", {}) or {}
+        self.pre_cfg = self.cfg.get("preprocess.json", {}) or {}
+        self.post_cfg = self.cfg.get("postprocess.json", {}) or {}
+        classes_raw = self.cfg.get("classes.json", []) or []
+        if isinstance(classes_raw, dict) and "class_names" in classes_raw:
+            classes_raw = classes_raw["class_names"]
+        self.class_names: List[str] = list(classes_raw) if isinstance(classes_raw, list) else []
+
+        self.task = str(self.model_cfg.get("task") or "detect").strip().lower()
+        self.topk = int(topk) if topk is not None else int(self.post_cfg.get("topk_default", 300) or 300)
+        self.score_thresh = float(score_thresh) if score_thresh is not None else float(self.post_cfg.get("score_threshold_default", 0.3))
+        self.mask_thresh = float(mask_thresh) if mask_thresh is not None else float(self.post_cfg.get("mask_threshold_default", 0.5))
+        
+        self.backend = str(backend or "auto").strip().lower()
+        self.device_str = device
+        self.weights_path = weights_path.expanduser().resolve() if weights_path else (self.bundle_dir / "checkpoint.pth")
+        
+        self.session = None
+        self.model = None
+        self.engine = None
+        self.active_backend = None
+
+        self._init_backend(
+            checkpoint_key=checkpoint_key,
+            use_checkpoint_model=use_checkpoint_model,
+            strict=strict
+        )
+
+    def _init_backend(self, checkpoint_key, use_checkpoint_model, strict):
+        engine_path = self.bundle_dir / "model.engine"
+        onnx_path = self.bundle_dir / "model.onnx"
+
+        # 1. Try TensorRT
+        if self.backend in {"auto", "tensorrt"} and engine_path.exists():
+            try:
+                import tensorrt as trt
+                import pycuda.autoinit
+                import pycuda.driver as cuda
+                
+                logger = trt.Logger(trt.Logger.WARNING)
+                runtime = trt.Runtime(logger)
+                self.engine = runtime.deserialize_cuda_engine(engine_path.read_bytes())
+                if self.engine:
+                    self.context = self.engine.create_execution_context()
+                    self.active_backend = "tensorrt"
+                    return
+            except Exception as e:
+                if self.backend == "tensorrt":
+                    raise RuntimeError(f"Failed to load TensorRT: {e}")
+
+        # 2. Try ONNX
+        if self.backend in {"auto", "onnx"} and onnx_path.exists():
+            try:
+                import onnxruntime as ort
+                providers = ["CPUExecutionProvider"]
+                try:
+                    available = set(ort.get_available_providers())
+                except Exception:
+                    available = set()
+                wants_cuda = (self.device_str is None) or str(self.device_str).lower().startswith("cuda")
+                if wants_cuda and "CUDAExecutionProvider" in available:
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                
+                self.session = ort.InferenceSession(str(onnx_path), providers=providers)
+                self.active_backend = "onnx"
+                return
+            except Exception as e:
+                if self.backend == "onnx":
+                    raise RuntimeError(f"Failed to load ONNX: {e}")
+
+        # 3. Fallback to PyTorch
+        try:
+            import torch
+            from .checkpoints import load_checkpoint_weights
+            
+            self.device = torch.device(self.device_str if self.device_str else ("cuda" if torch.cuda.is_available() else "cpu"))
+            model_obj = _instantiate_model(self.task, str(self.model_cfg.get("size") or "nano"), len(self.class_names) or None)
+            module = _unwrap_for_inference(model_obj)
+            
+            lr = load_checkpoint_weights(
+                module,
+                str(self.weights_path),
+                self.device,
+                checkpoint_key=checkpoint_key,
+                allow_replace_model=use_checkpoint_model,
+                strict=strict,
+                verbose=False
+            )
+            if lr.replacement_model is not None:
+                self.model = _unwrap_for_inference(lr.replacement_model)
+            else:
+                self.model = module
+            
+            if hasattr(self.model, "to"):
+                self.model.to(self.device)
+            if hasattr(self.model, "eval"):
+                self.model.eval()
+            
+            self.active_backend = "pytorch"
+        except Exception as e:
+            raise RuntimeError(f"Failed to load PyTorch backend: {e}")
+
+    def infer(self, image: Union[Path, "Image.Image", "np.ndarray"]) -> InferResult:
+        from PIL import Image
+        import numpy as np
+
+        if isinstance(image, Path):
+            pil = Image.open(str(image)).convert("RGB")
+            image_id = image.name
+        elif isinstance(image, Image.Image):
+            pil = image.convert("RGB")
+            image_id = "frame"
+        else:
+            # Assume numpy BGR
+            pil = Image.fromarray(image[:, :, ::-1]).convert("RGB")
+            image_id = "frame"
+
+        orig_w, orig_h = pil.size
+        policy = str(self.pre_cfg.get("resize_policy") or "letterbox").strip().lower()
+        target_w = int(self.pre_cfg.get("target_w") or 640)
+        target_h = int(self.pre_cfg.get("target_h") or 640)
+
+        # Implementation of backend-specific inference using pre-loaded sessions/models
+        if self.active_backend == "tensorrt":
+            return self._infer_tensorrt(pil, image_id, target_w, target_h, policy, orig_w, orig_h)
+        elif self.active_backend == "onnx":
+            return self._infer_onnx(pil, image_id, target_w, target_h, policy, orig_w, orig_h)
+        else:
+            return self._infer_pytorch(pil, image_id, target_w, target_h, policy, orig_w, orig_h)
+
+    def _infer_tensorrt(self, pil, image_id, target_w, target_h, policy, orig_w, orig_h) -> InferResult:
+        import numpy as np
+        import pycuda.driver as cuda
+        import tensorrt as trt
+
+        # Resolve dynamic shapes if any
+        use_tensor_api = hasattr(self.engine, "num_io_tensors") and hasattr(self.context, "set_tensor_address")
+        if use_tensor_api:
+            input_name = self.engine.get_tensor_name(0)
+            input_shape = self.engine.get_tensor_shape(input_name)
+        else:
+            input_shape = self.engine.get_binding_shape(0)
+
+        if len(input_shape) >= 4:
+            if input_shape[2] > 0: target_h = input_shape[2]
+            if input_shape[3] > 0: target_w = input_shape[3]
+
+        if policy == "letterbox":
+            pil_in, lb = letterbox_pil(pil, target_w=target_w, target_h=target_h)
+        else:
+            pil_in = pil.resize((target_w, target_h))
+            lb = None
+
+        arr = np.asarray(pil_in, dtype=np.float32) / 255.0
+        arr = np.transpose(arr, (2, 0, 1))[None, ...].astype(np.float32)
+        arr = np.ascontiguousarray(arr)
+
+        # Simplified TensorRT execution for speed (reusing buffers if possible, but for now just allocate)
+        # In a real production video loop, you'd pre-allocate these.
+        outputs = {}
+        bindings = []
+        
+        if use_tensor_api:
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    d_input = cuda.mem_alloc(arr.nbytes)
+                    cuda.memcpy_htod(d_input, arr)
+                    self.context.set_tensor_address(name, int(d_input))
+                else:
+                    shape = self.context.get_tensor_shape(name)
+                    dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+                    host_out = np.empty(shape, dtype=dtype)
+                    d_output = cuda.mem_alloc(host_out.nbytes)
+                    self.context.set_tensor_address(name, int(d_output))
+                    outputs[name] = (host_out, d_output)
+            
+            self.context.execute_v2([]) # Binding-less API
+            for name, (host, device) in outputs.items():
+                cuda.memcpy_dtoh(host, device)
+            out = {n: h for n, (h, d) in outputs.items()}
+        else:
+            # Fallback for older TensorRT
+            for i in range(self.engine.num_bindings):
+                if self.engine.binding_is_input(i):
+                    d_input = cuda.mem_alloc(arr.nbytes)
+                    cuda.memcpy_htod(d_input, arr)
+                    bindings.append(int(d_input))
+                else:
+                    shape = self.engine.get_binding_shape(i)
+                    dtype = trt.nptype(self.engine.get_binding_dtype(i))
+                    host_out = np.empty(shape, dtype=dtype)
+                    d_output = cuda.mem_alloc(host_out.nbytes)
+                    bindings.append(int(d_output))
+                    outputs[str(self.engine.get_binding_name(i))] = (host_out, d_output)
+            
+            self.context.execute_v2(bindings)
+            for name, (host, device) in outputs.items():
+                cuda.memcpy_dtoh(host, device)
+            out = {n: h for n, (h, d) in outputs.items()}
+
+        return self._postprocess(out, target_w, target_h, lb, orig_w, orig_h, image_id, "tensorrt")
+
+    def _infer_onnx(self, pil, image_id, target_w, target_h, policy, orig_w, orig_h) -> InferResult:
+        import numpy as np
+        inputs = self.session.get_inputs()
+        input_shape = inputs[0].shape
+        if len(input_shape) >= 4:
+            if isinstance(input_shape[2], int) and input_shape[2] > 0: target_h = input_shape[2]
+            if isinstance(input_shape[3], int) and input_shape[3] > 0: target_w = input_shape[3]
+
+        if policy == "letterbox":
+            pil_in, lb = letterbox_pil(pil, target_w=target_w, target_h=target_h)
+        else:
+            pil_in = pil.resize((target_w, target_h))
+            lb = None
+
+        arr = np.asarray(pil_in, dtype=np.float32) / 255.0
+        arr = np.transpose(arr, (2, 0, 1))[None, ...].astype(np.float32)
+
+        output_names = [out.name for out in self.session.get_outputs()]
+        raw_outputs = self.session.run(output_names, {inputs[0].name: arr})
+        out = {name: value for name, value in zip(output_names, raw_outputs)}
+
+        return self._postprocess(out, target_w, target_h, lb, orig_w, orig_h, image_id, "onnx")
+
+    def _infer_pytorch(self, pil, image_id, target_w, target_h, policy, orig_w, orig_h) -> InferResult:
+        import torch
+        import torchvision.transforms as T
+        from .torch_compat import infer_backbone_patch_size
+        
+        patch_size = infer_backbone_patch_size(self.model)
+        target_h, target_w = _adjust_dims_to_patch_size(target_h=target_h, target_w=target_w, patch_size=patch_size)
+
+        if policy == "letterbox":
+            pil_in, lb = letterbox_pil(pil, target_w=target_w, target_h=target_h)
+        else:
+            pil_in = pil.resize((target_w, target_h))
+            lb = None
+
+        want_masks = self.task == "seg"
+        
+        # Try predict method first
+        predict_fn = getattr(self.model, "predict", None)
+        if callable(predict_fn):
+            try:
+                with torch.inference_mode():
+                    out = predict_fn(pil, threshold=self.score_thresh)
+                    # predict usually handles resizing internally to original size
+                    boxes, scores, labels, masks = parse_model_output_generic(
+                        out, img_w=orig_w, img_h=orig_h, 
+                        score_thresh=self.score_thresh, want_masks=want_masks, 
+                        mask_thresh=self.mask_thresh, topk=self.topk
+                    )
+                    payload = detections_to_json(boxes, scores, labels, self.class_names, image_id, self.score_thresh)
+                    payload["inference_backend"] = "pytorch"
+                    if want_masks and masks is not None: payload["masks_present"] = True
+                    return InferResult(True, payload, "ok:pytorch", boxes=boxes, scores=scores, labels=labels, masks=masks)
+            except Exception:
+                pass
+
+        tensor = T.ToTensor()(pil_in).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            out = self.model(tensor)
+        
+        return self._postprocess(out, target_w, target_h, lb, orig_w, orig_h, image_id, "pytorch")
+
+    def _postprocess(self, out, target_w, target_h, lb, orig_w, orig_h, image_id, backend_name) -> InferResult:
+        want_masks = self.task == "seg"
+        boxes, scores, labels, masks = parse_model_output_generic(
+            out,
+            img_w=int(target_w),
+            img_h=int(target_h),
+            score_thresh=self.score_thresh,
+            want_masks=want_masks,
+            mask_thresh=self.mask_thresh,
+            topk=self.topk,
+        )
+
+        if lb is not None:
+            boxes = [unletterbox_xyxy(b, lb=lb, orig_w=orig_w, orig_h=orig_h) for b in boxes]
+            if want_masks and masks is not None:
+                masks = [unletterbox_mask(m, lb=lb, orig_w=orig_w, orig_h=orig_h, mask_thresh=self.mask_thresh) for m in masks]
+
+        payload = detections_to_json(
+            boxes=boxes,
+            scores=scores,
+            labels=labels,
+            class_names=self.class_names,
+            image_id=image_id,
+            score_thresh=self.score_thresh,
+        )
+        payload["inference_backend"] = backend_name
+        if want_masks and masks is not None:
+            payload["masks_present"] = True
+
+        return InferResult(True, payload, f"ok:{backend_name}", boxes=boxes, scores=scores, labels=labels, masks=masks)
+
+
 def infer_from_bundle(
     *,
     bundle_dir: Path,
@@ -553,68 +869,8 @@ def infer_from_bundle(
     backend: str = "auto",
     topk: Optional[int] = None,
 ) -> InferResult:
-    bundle_dir = bundle_dir.expanduser().resolve()
-    image_path = image_path.expanduser().resolve()
-    if not bundle_dir.exists():
-        return InferResult(False, None, f"Bundle dir not found: {bundle_dir}")
-    if not image_path.exists():
-        return InferResult(False, None, f"Image not found: {image_path}")
-
-    cfg = load_bundle_config(bundle_dir)
-    model_cfg = cfg.get("model_config.json", {}) or {}
-    pre_cfg = cfg.get("preprocess.json", {}) or {}
-    post_cfg = cfg.get("postprocess.json", {}) or {}
-    classes_raw = cfg.get("classes.json", []) or []
-    if isinstance(classes_raw, dict) and "class_names" in classes_raw:
-        classes_raw = classes_raw["class_names"]
-    class_names: List[str] = list(classes_raw) if isinstance(classes_raw, list) else []
-
-    task = str(model_cfg.get("task") or "detect").strip().lower()
-    topk_final = int(topk) if topk is not None else int(post_cfg.get("topk_default", 300) or 300)
-    backend_norm = str(backend or "auto").strip().lower()
-    engine_path = bundle_dir / "model.engine"
-    onnx_path = bundle_dir / "model.onnx"
-
-    if backend_norm not in {"auto", "tensorrt", "onnx", "pytorch"}:
-        return InferResult(False, None, f"Unsupported backend: {backend}")
-
-    if backend_norm == "tensorrt" and not engine_path.exists():
-        return InferResult(False, None, f"TensorRT engine not found: {engine_path}")
-    if backend_norm == "onnx" and not onnx_path.exists():
-        return InferResult(False, None, f"ONNX model not found: {onnx_path}")
-
-    if backend_norm in {"auto", "tensorrt"} and engine_path.exists():
-        trt_res = _run_tensorrt_inference(
-            bundle_dir=bundle_dir,
-            image_path=image_path,
-            pre_cfg={**pre_cfg, "task": task},
-            post_cfg=post_cfg,
-            class_names=class_names,
-            score_thresh=score_thresh,
-            mask_thresh=mask_thresh,
-            topk=int(topk_final),
-        )
-        if trt_res.ok or backend_norm == "tensorrt":
-            return trt_res
-
-    if backend_norm in {"auto", "onnx"} and onnx_path.exists():
-        onnx_res = _run_onnx_inference(
-            bundle_dir=bundle_dir,
-            image_path=image_path,
-            pre_cfg={**pre_cfg, "task": task},
-            post_cfg=post_cfg,
-            class_names=class_names,
-            score_thresh=score_thresh,
-            mask_thresh=mask_thresh,
-            device=device,
-            topk=int(topk_final),
-        )
-        if onnx_res.ok or backend_norm == "onnx":
-            return onnx_res
-
-    return _run_pytorch_inference(
+    engine = InferenceEngine(
         bundle_dir=bundle_dir,
-        image_path=image_path,
         weights_path=weights_path,
         device=device,
         score_thresh=score_thresh,
@@ -622,5 +878,7 @@ def infer_from_bundle(
         checkpoint_key=checkpoint_key,
         use_checkpoint_model=use_checkpoint_model,
         strict=strict,
-        topk=int(topk_final),
+        backend=backend,
+        topk=topk
     )
+    return engine.infer(image_path)
