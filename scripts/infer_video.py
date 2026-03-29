@@ -24,7 +24,7 @@ from infer_webcam import (
     load_class_names,
 )
 from moldvision.checkpoints import load_checkpoint_weights
-from moldvision.deploy import letterbox_pil, parse_model_output_generic, unletterbox_mask, unletterbox_xyxy
+from moldvision.postprocess import letterbox_pil, parse_model_output_generic, unletterbox_mask, unletterbox_xyxy
 from moldvision.torch_compat import unwrap_torch_module
 import torchvision.transforms as T
 from PIL import Image
