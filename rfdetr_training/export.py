@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from .pathutil import resolve_path
 
 from .checkpoints import load_checkpoint_weights
 from .datasets import load_metadata
@@ -33,16 +34,16 @@ def quantize_onnx(
     """Quantize an existing ONNX model to INT8."""
     from .quantization import quantize_onnx_model
 
-    onnx_path = onnx_path.expanduser().resolve()
+    onnx_path = resolve_path(onnx_path)
     if output_path is None:
         output_path = onnx_path.with_name(onnx_path.stem + "_quantized.onnx")
     else:
-        output_path = output_path.expanduser().resolve()
+        output_path = resolve_path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
     calibration_images: List[Path] = []
     if dataset_dir:
-        dataset_dir = dataset_dir.expanduser().resolve()
+        dataset_dir = resolve_path(dataset_dir)
         split_dir = dataset_dir / "coco" / calibration_split
         ann_path = split_dir / "_annotations.coco.json"
         if ann_path.exists():
@@ -170,8 +171,8 @@ def export_onnx(
     except Exception as e:
         return ExportResult(False, None, f"PyTorch not available: {e}")
 
-    dataset_dir = dataset_dir.expanduser().resolve()
-    weights = weights.expanduser().resolve()
+    dataset_dir = resolve_path(dataset_dir)
+    weights = resolve_path(weights)
 
     md = load_metadata(dataset_dir)
     class_names = md.get("class_names", []) or []
@@ -373,7 +374,7 @@ def export_onnx(
         out_dir.mkdir(parents=True, exist_ok=True)
         output = out_dir / ("model_seg.onnx" if want_masks else "model_detect.onnx")
     else:
-        output = output.expanduser().resolve()
+        output = resolve_path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
 
     input_names = ["images"]
@@ -441,11 +442,11 @@ def export_tensorrt_from_onnx(
 
     This keeps TensorRT as an optional deployment tool (no hard dependency).
     """
-    onnx_path = onnx_path.expanduser().resolve()
+    onnx_path = resolve_path(onnx_path)
     if engine_path is None:
         engine_path = onnx_path.with_suffix(".engine")
     else:
-        engine_path = engine_path.expanduser().resolve()
+        engine_path = resolve_path(engine_path)
         engine_path.parent.mkdir(parents=True, exist_ok=True)
 
     trtexec = shutil.which("trtexec")

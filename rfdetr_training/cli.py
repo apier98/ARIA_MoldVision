@@ -6,6 +6,7 @@ import sys
 import os
 from pathlib import Path
 from typing import List
+from .pathutil import resolve_path
 
 from . import appconfig
 from .coco import (
@@ -35,7 +36,7 @@ def _parse_classes(values: List[str] | None, classes_file: str | None) -> List[s
             parts = [p.strip() for p in entry.replace(",", " ").split() if p.strip()]
             cls.extend(parts)
     if classes_file:
-        p = Path(classes_file).expanduser().resolve()
+        p = resolve_path(classes_file)
         if not p.exists():
             raise FileNotFoundError(f"Classes file not found: {p}")
         for line in p.read_text(encoding="utf-8").splitlines():
@@ -53,7 +54,7 @@ def _parse_classes(values: List[str] | None, classes_file: str | None) -> List[s
 
 
 def _load_jsonish(path: str) -> dict:
-    p = Path(path).expanduser().resolve()
+    p = resolve_path(path)
     if not p.exists():
         raise FileNotFoundError(f"Config file not found: {p}")
     txt = p.read_text(encoding="utf-8")
@@ -73,7 +74,7 @@ def _load_jsonish(path: str) -> dict:
 
 
 def _load_trained_model_config(dataset_dir: Path) -> dict:
-    p = dataset_dir.expanduser().resolve() / "models" / "model_config.json"
+    p = resolve_path(dataset_dir) / "models" / "model_config.json"
     if not p.exists():
         return {}
     try:
@@ -106,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Model size preset. Default: auto (from datasets/<UUID>/models/model_config.json). Ignored if using checkpoint model.",
     )
-    ex.add_argument("--format", choices=["onnx", "tensorrt", "onnx_quantized", "onnx_fp16"], default="onnx")
+    ex.add_argument("--format", choices=["onnx", "tensorrt", "onnx_quantized", "onnx_fp16"], default=None, help="Export format (default: from config/env, fallback onnx)")
     ex.add_argument("--output", "-o", default=None, help="Output path (.onnx or .engine). Default: datasets/<UUID>/exports/")
     ex.add_argument("--device", default=None, help="Device for export (e.g. cuda:0, cpu)")
     ex.add_argument("--height", type=int, default=640)
@@ -210,7 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--bundle-dir", "-b", required=True)
     inf.add_argument("--image", "-i", required=True)
     inf.add_argument("--weights", "-w", default=None, help="Override fallback checkpoint path (default: <bundle>/checkpoint.pth)")
-    inf.add_argument("--backend", choices=["auto", "tensorrt", "onnx", "pytorch"], default="auto", help="Inference backend. Default: auto (prefer TensorRT, then ONNX)")
+    inf.add_argument("--backend", choices=["auto", "tensorrt", "onnx", "pytorch"], default=None, help="Inference backend (default: from config/env, fallback auto)")
     inf.add_argument("--device", default=None)
     inf.add_argument("--threshold", type=float, default=None)
     inf.add_argument("--mask-thresh", type=float, default=None)
@@ -343,6 +344,12 @@ def build_parser() -> argparse.ArgumentParser:
     ds_ext.add_argument("--dataset-dir", "-d", default=None, help="Dataset folder; if provided, frames are saved in <dataset-dir>/raw")
     ds_ext.add_argument("--out-dir", "-o", default=None, help="Custom output directory; overrides --dataset-dir")
 
+    ds_list = ds_sub.add_parser("list", help="List all datasets under the configured root directory")
+    ds_list.add_argument("--root", "-r", default=None, help="Root directory to scan (default: resolved from config/env)")
+
+    ds_info = ds_sub.add_parser("info", help="Show detailed information about a dataset")
+    ds_info.add_argument("--dataset-dir", "-d", required=True, help="Path to a dataset UUID folder")
+
     # train
     tr = sub.add_parser("train", help="Train an RF-DETR model")
     tr.add_argument("--dataset-dir", "-d", required=True)
@@ -445,6 +452,15 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_ds = cfg_set_sub.add_parser("dataset-root", help="Set the default dataset root directory")
     cfg_ds.add_argument("path", help="Absolute or ~ path to use as the default dataset root")
 
+    cfg_nw = cfg_set_sub.add_parser("num-workers", help="Set the default DataLoader worker count")
+    cfg_nw.add_argument("value", type=int, help="Number of workers (0 recommended on Windows)")
+
+    cfg_bk = cfg_set_sub.add_parser("inference-backend", help="Set the preferred inference backend")
+    cfg_bk.add_argument("value", choices=list(appconfig.VALID_BACKENDS), help="Backend name")
+
+    cfg_ef = cfg_set_sub.add_parser("export-format", help="Set the default export format")
+    cfg_ef.add_argument("value", choices=list(appconfig.VALID_EXPORT_FORMATS), help="Format name")
+
     return p
 
 
@@ -485,19 +501,14 @@ def main(argv: List[str] | None = None) -> int:
             print(f"- rfdetr: not importable ({e})")
 
         print(f"- config file: {appconfig.config_path()}")
-        default_root = appconfig.get_default_dataset_root()
-        env_override = os.environ.get(appconfig.ENV_DATASETS)
-        if env_override:
-            print(f"- default dataset root: {default_root}  (from env {appconfig.ENV_DATASETS})")
-        else:
-            file_root = appconfig.load_config().get("default_dataset_root")
-            if file_root:
-                print(f"- default dataset root: {default_root}  (from config file)")
-            else:
-                print(f"- default dataset root: {default_root}  (fallback; use 'moldvision config set dataset-root <path>' to change)")
+        print(f"- default dataset root: {appconfig.get_default_dataset_root()}")
+        print(f"- default num_workers:  {appconfig.get_default_num_workers()}")
+        print(f"- inference backend:    {appconfig.get_default_inference_backend()}")
+        print(f"- export format:        {appconfig.get_default_export_format()}")
+        print(f"  (use 'moldvision config set <key> <value>' to change)")
 
         if os.name == "nt":
-            print("- hint: on Windows, set --num-workers 0 to avoid multiprocessing issues")
+            print("- hint: on Windows, num-workers defaults to 0 to avoid multiprocessing issues")
         print("- hint: if you see 'Inference tensors cannot be saved for backward', enable --patch-inference-mode")
         print(
             "- hint: if you see OOM, reduce --batch-size/--resolution; "
@@ -543,7 +554,7 @@ def main(argv: List[str] | None = None) -> int:
             return 2
 
     if args.cmd == "dataset" and args.dataset_cmd == "validate":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         coco_dir = dataset_dir / "coco"
         if args.split in ("all", "test"):
             created = ensure_minimal_test_split(coco_dir)
@@ -565,7 +576,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0 if ok else 3
 
     if args.cmd == "dataset" and args.dataset_cmd == "prune-empty-masks":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         coco_dir = dataset_dir / "coco"
         splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
         ok = True
@@ -581,7 +592,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0 if ok else 3
 
     if args.cmd == "dataset" and args.dataset_cmd == "prune-small-masks":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         coco_dir = dataset_dir / "coco"
         splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
         ok = True
@@ -602,7 +613,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0 if ok else 3
 
     if args.cmd == "dataset" and args.dataset_cmd == "normalize-coco-ids":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         coco_dir = dataset_dir / "coco"
         splits = ["train", "valid", "test"] if args.split == "all" else [args.split]
         ok = True
@@ -634,7 +645,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0 if ok else 3
 
     if args.cmd == "dataset" and args.dataset_cmd == "align-metadata":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         coco_dir = dataset_dir / "coco"
         md = load_metadata(dataset_dir)
         class_names = md.get("class_names", []) or []
@@ -655,7 +666,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0 if ok else 3
 
     if args.cmd == "dataset" and args.dataset_cmd == "reset-coco":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         ok, msg = reset_coco_dir(dataset_dir, backup=(not bool(args.no_backup)))
         if not ok:
             print(f"Error: {msg}", file=sys.stderr)
@@ -664,7 +675,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0
 
     if args.cmd == "dataset" and args.dataset_cmd == "subsample":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         coco_dir = dataset_dir / "coco"
         res = subsample_coco_split(
             coco_dir / args.split,
@@ -683,7 +694,7 @@ def main(argv: List[str] | None = None) -> int:
         return 0
 
     if args.cmd == "dataset" and args.dataset_cmd == "import-coco":
-        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        dataset_dir = resolve_path(args.dataset_dir)
         src_json = Path(args.coco_json)
         src_images = Path(args.images_dir) if args.images_dir else None
 
@@ -754,7 +765,7 @@ def main(argv: List[str] | None = None) -> int:
 
         video_paths = []
         for v in args.videos:
-            p = Path(v).expanduser().resolve()
+            p = resolve_path(v)
             if not p.exists():
                 print(f"Warning: Video not found: {p}")
                 continue
@@ -777,45 +788,148 @@ def main(argv: List[str] | None = None) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 2
 
+    if args.cmd == "dataset" and args.dataset_cmd == "list":
+        root = resolve_path(args.root) if args.root else resolve_path(appconfig.get_default_dataset_root())
+        if not root.exists():
+            print(f"Dataset root not found: {root}", file=sys.stderr)
+            return 2
+        datasets_found = []
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            md_path = entry / "METADATA.json"
+            if not md_path.exists():
+                continue
+            try:
+                md = json.loads(md_path.read_text(encoding="utf-8"))
+            except Exception:
+                md = {}
+            model_cfg_path = entry / "models" / "model_config.json"
+            try:
+                mcfg = json.loads(model_cfg_path.read_text(encoding="utf-8")) if model_cfg_path.exists() else {}
+            except Exception:
+                mcfg = {}
+            datasets_found.append({
+                "uuid": md.get("uuid", entry.name),
+                "name": md.get("name", ""),
+                "created_at": (md.get("created_at", "")[:10] if md.get("created_at") else ""),
+                "classes": len(md.get("class_names", [])),
+                "task": mcfg.get("task", "-"),
+                "trained": "yes" if model_cfg_path.exists() else "no",
+            })
+        if not datasets_found:
+            print(f"No datasets found under: {root}")
+            return 0
+        print(f"Datasets in: {root}\n")
+        col = "{:<38} {:<24} {:<12} {:>7} {:<8} {:<7}"
+        print(col.format("UUID", "Name", "Created", "Classes", "Task", "Trained"))
+        print("-" * 102)
+        for d in datasets_found:
+            print(col.format(d["uuid"], d["name"][:23], d["created_at"], d["classes"], d["task"], d["trained"]))
+        print(f"\n{len(datasets_found)} dataset(s) found.")
+        return 0
+
+    if args.cmd == "dataset" and args.dataset_cmd == "info":
+        dataset_dir = resolve_path(args.dataset_dir)
+        md_path = dataset_dir / "METADATA.json"
+        if not md_path.exists():
+            print(f"Error: Not a valid dataset directory (METADATA.json missing): {dataset_dir}", file=sys.stderr)
+            return 2
+        try:
+            md = json.loads(md_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Error: Could not read METADATA.json: {e}", file=sys.stderr)
+            return 2
+        print(f"Dataset : {dataset_dir}")
+        print(f"UUID    : {md.get('uuid', '-')}")
+        print(f"Name    : {md.get('name', '-')}")
+        print(f"Created : {md.get('created_at', '-')}")
+        classes = md.get("class_names", [])
+        print(f"Classes : {len(classes)}  {classes}")
+        if md.get("notes"):
+            print(f"Notes   : {md['notes']}")
+        print()
+        # Split stats
+        coco_dir = dataset_dir / "coco"
+        for split in ("train", "valid", "test"):
+            ann_path = coco_dir / split / "_annotations.coco.json"
+            if ann_path.exists():
+                try:
+                    data = json.loads(ann_path.read_text(encoding="utf-8"))
+                    n_img = len(data.get("images", []))
+                    n_ann = len(data.get("annotations", []))
+                    print(f"  {split:<6}: {n_img:>5} images, {n_ann:>6} annotations")
+                except Exception:
+                    print(f"  {split:<6}: (could not read)")
+            else:
+                print(f"  {split:<6}: (no annotations)")
+        # Model status
+        model_cfg_path = dataset_dir / "models" / "model_config.json"
+        print()
+        if model_cfg_path.exists():
+            try:
+                mcfg = json.loads(model_cfg_path.read_text(encoding="utf-8"))
+                print(f"Trained : yes  (task={mcfg.get('task','-')}, size={mcfg.get('size','-')}, classes={mcfg.get('num_classes','-')})")
+            except Exception:
+                print("Trained : yes  (model_config.json unreadable)")
+        else:
+            print("Trained : no")
+        # Exports
+        exports_dir = dataset_dir / "exports"
+        if exports_dir.exists():
+            exported = [f.name for f in sorted(exports_dir.iterdir()) if f.is_file()]
+            if exported:
+                print(f"Exports : {', '.join(exported)}")
+        return 0
+
     if args.cmd == "train":
-        aug_cfg = None
-        if getattr(args, "aug_config", None):
-            aug_cfg = _load_jsonish(str(args.aug_config))
-        cfg = TrainConfig(
-            dataset_dir=Path(args.dataset_dir),
-            task=args.task,
-            size=args.size,
-            epochs=int(args.epochs),
-            batch_size=int(args.batch_size),
-            grad_accum=int(args.grad_accum),
-            lr=float(args.lr),
-            device=args.device,
-            num_workers=args.num_workers,
-            resolution=args.resolution,
-            output_dir=(Path(args.output_dir) if args.output_dir else None),
-            pretrained=bool(args.pretrained),
-            pretrain_weights=args.pretrain_weights,
-            tensorboard=bool(args.tensorboard),
-            wandb=bool(args.wandb),
-            early_stopping=bool(args.early_stopping),
-            eval_only=bool(getattr(args, "eval_only", False)),
-            num_queries=args.num_queries,
-            num_select=args.num_select,
-            run_test=bool(args.run_test),
-            benchmark=bool(args.benchmark),
-            resume=args.resume,
-            finetune_from=args.finetune_from,
-            use_checkpoint_model=bool(args.use_checkpoint_model),
-            checkpoint_key=args.checkpoint_key,
-            patch_inference_mode=args.patch_inference_mode,
-            validate_dataset=(not bool(args.no_validate)),
-            multi_scale=getattr(args, "multi_scale", None),
-            expanded_scales=getattr(args, "expanded_scales", None),
-            do_random_resize_via_padding=getattr(args, "do_random_resize_via_padding", None),
-            aug_config=aug_cfg,
-            no_aug=bool(getattr(args, "no_aug", False)),
-        )
-        return int(train(cfg))
+        try:
+            aug_cfg = None
+            if getattr(args, "aug_config", None):
+                aug_cfg = _load_jsonish(str(args.aug_config))
+            # Resolve num_workers: explicit arg > appconfig default
+            num_workers = args.num_workers if args.num_workers is not None else appconfig.get_default_num_workers()
+            cfg = TrainConfig(
+                dataset_dir=Path(args.dataset_dir),
+                task=args.task,
+                size=args.size,
+                epochs=int(args.epochs),
+                batch_size=int(args.batch_size),
+                grad_accum=int(args.grad_accum),
+                lr=float(args.lr),
+                device=args.device,
+                num_workers=num_workers,
+                resolution=args.resolution,
+                output_dir=(Path(args.output_dir) if args.output_dir else None),
+                pretrained=bool(args.pretrained),
+                pretrain_weights=args.pretrain_weights,
+                tensorboard=bool(args.tensorboard),
+                wandb=bool(args.wandb),
+                early_stopping=bool(args.early_stopping),
+                eval_only=bool(getattr(args, "eval_only", False)),
+                num_queries=args.num_queries,
+                num_select=args.num_select,
+                run_test=bool(args.run_test),
+                benchmark=bool(args.benchmark),
+                resume=args.resume,
+                finetune_from=args.finetune_from,
+                use_checkpoint_model=bool(args.use_checkpoint_model),
+                checkpoint_key=args.checkpoint_key,
+                patch_inference_mode=args.patch_inference_mode,
+                validate_dataset=(not bool(args.no_validate)),
+                multi_scale=getattr(args, "multi_scale", None),
+                expanded_scales=getattr(args, "expanded_scales", None),
+                do_random_resize_via_padding=getattr(args, "do_random_resize_via_padding", None),
+                aug_config=aug_cfg,
+                no_aug=bool(getattr(args, "no_aug", False)),
+            )
+            return int(train(cfg))
+        except KeyboardInterrupt:
+            print("\nTraining interrupted.", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
 
     if args.cmd == "export":
         dataset_dir = Path(args.dataset_dir)
@@ -824,8 +938,15 @@ def main(argv: List[str] | None = None) -> int:
         trained_model_cfg = _load_trained_model_config(dataset_dir)
         task = str(args.task or trained_model_cfg.get("task") or "detect").strip().lower()
         size = str(args.size or trained_model_cfg.get("size") or "nano").strip().lower()
+        # Resolve format: explicit arg > appconfig default
+        fmt = args.format or appconfig.get_default_export_format()
+        # Validate --quantize usage
+        if args.quantize and fmt == "tensorrt":
+            print("Error: --quantize is not supported with --format tensorrt. "
+                  "Use --format onnx_quantized to export a quantized ONNX model.", file=sys.stderr)
+            return 2
 
-        if args.format in {"onnx", "onnx_quantized", "onnx_fp16"}:
+        if fmt in {"onnx", "onnx_quantized", "onnx_fp16"}:
             res = export_onnx(
                 dataset_dir=dataset_dir,
                 weights=weights,
@@ -840,16 +961,16 @@ def main(argv: List[str] | None = None) -> int:
                 use_checkpoint_model=bool(args.use_checkpoint_model),
                 checkpoint_key=args.checkpoint_key,
                 strict=bool(args.strict),
-                half=(args.format == "onnx_fp16" or args.fp16),
+                half=(fmt == "onnx_fp16" or args.fp16),
             )
             if not res.ok:
                 print(f"Error: {res.message}", file=sys.stderr)
                 return 2
-            
-            if args.format == "onnx_quantized" or args.quantize:
+
+            if fmt == "onnx_quantized" or args.quantize:
                 q_res = quantize_onnx(
                     onnx_path=res.output_path,
-                    output_path=None, # Auto name
+                    output_path=None,
                     dataset_dir=dataset_dir,
                     calibration_split=args.calibration_split,
                     calibration_count=args.calibration_count,
@@ -861,7 +982,7 @@ def main(argv: List[str] | None = None) -> int:
                     return 2
                 print(q_res.message)
                 return 0
-            
+
             print(res.message)
             return 0
 
@@ -951,18 +1072,24 @@ def main(argv: List[str] | None = None) -> int:
         bundle_dir = Path(args.bundle_dir)
         image_path = Path(args.image)
         weights = Path(args.weights) if args.weights else None
-        res = infer_from_bundle(
-            bundle_dir=bundle_dir,
-            image_path=image_path,
-            weights_path=weights,
-            device=args.device,
-            score_thresh=args.threshold,
-            mask_thresh=args.mask_thresh,
-            checkpoint_key=args.checkpoint_key,
-            use_checkpoint_model=bool(args.use_checkpoint_model),
-            strict=bool(args.strict),
-            backend=str(args.backend),
-        )
+        # Resolve backend: explicit arg > appconfig default
+        backend = args.backend or appconfig.get_default_inference_backend()
+        try:
+            res = infer_from_bundle(
+                bundle_dir=bundle_dir,
+                image_path=image_path,
+                weights_path=weights,
+                device=args.device,
+                score_thresh=args.threshold,
+                mask_thresh=args.mask_thresh,
+                checkpoint_key=args.checkpoint_key,
+                use_checkpoint_model=bool(args.use_checkpoint_model),
+                strict=bool(args.strict),
+                backend=str(backend),
+            )
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
         if not res.ok or res.payload is None:
             print(f"Error: {res.message}", file=sys.stderr)
             return 2
@@ -1011,7 +1138,7 @@ def main(argv: List[str] | None = None) -> int:
                             draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
                             draw.text((x1 + 2, max(0, y1 - 12)), f"{int(lab)}:{float(sc):.2f}", fill=(0, 255, 0))
 
-                    out_img = Path(args.out_image).expanduser().resolve()
+                    out_img = resolve_path(args.out_image)
                     out_img.parent.mkdir(parents=True, exist_ok=True)
                     img.save(str(out_img))
                     print(f"Wrote: {out_img}")
@@ -1019,7 +1146,7 @@ def main(argv: List[str] | None = None) -> int:
                     print(f"Warning: failed to write --out-image ({e})", file=sys.stderr)
 
         if args.out_json:
-            outp = Path(args.out_json).expanduser().resolve()
+            outp = resolve_path(args.out_json)
             outp.parent.mkdir(parents=True, exist_ok=True)
             outp.write_text(json.dumps(res.payload, indent=2), encoding="utf-8")
             print(f"Wrote: {outp}")
@@ -1030,29 +1157,45 @@ def main(argv: List[str] | None = None) -> int:
     if args.cmd == "config":
         if args.config_cmd == "show":
             cfg_data = appconfig.load_config()
-            effective_root = appconfig.get_default_dataset_root()
-            env_override = os.environ.get(appconfig.ENV_DATASETS)
-            print(f"Config file : {appconfig.config_path()}")
+            print(f"Config file  : {appconfig.config_path()}")
             print(f"Config exists: {appconfig.config_path().exists()}")
             print()
             print("Effective settings:")
-            if env_override:
-                print(f"  default_dataset_root = {effective_root}  [env: {appconfig.ENV_DATASETS}]")
-            else:
-                src = "(config file)" if cfg_data.get("default_dataset_root") else "(fallback default)"
-                print(f"  default_dataset_root = {effective_root}  {src}")
-            if cfg_data:
-                print()
-                print("Stored config (raw):")
-                for k, v in cfg_data.items():
-                    print(f"  {k} = {v!r}")
+
+            def _show(key: str, value: object, env_var: str, fallback_note: str = "") -> None:
+                env_val = os.environ.get(env_var)
+                source = f"[env: {env_var}]" if env_val else ("(config file)" if key in cfg_data else f"(fallback{': ' + fallback_note if fallback_note else ''})")
+                print(f"  {key:<28} = {value}  {source}")
+
+            _show("default_dataset_root", appconfig.get_default_dataset_root(), appconfig.ENV_DATASETS, "datasets/")
+            _show("default_num_workers",  appconfig.get_default_num_workers(),  appconfig.ENV_NUM_WORKERS, "0 on Windows, 4 elsewhere")
+            _show("inference_backend",    appconfig.get_default_inference_backend(), appconfig.ENV_BACKEND, "auto")
+            _show("export_format",        appconfig.get_default_export_format(), appconfig.ENV_EXPORT_FORMAT, "onnx")
             return 0
 
-        if args.config_cmd == "set" and args.config_set_cmd == "dataset-root":
-            resolved = str(Path(args.path).expanduser())
-            appconfig.set_default_dataset_root(resolved)
-            print(f"default_dataset_root set to: {resolved}")
-            print(f"Config file: {appconfig.config_path()}")
+        if args.config_cmd == "set":
+            if args.config_set_cmd == "dataset-root":
+                resolved = str(Path(args.path).expanduser())
+                appconfig.set_default_dataset_root(resolved)
+                print(f"default_dataset_root → {resolved}")
+            elif args.config_set_cmd == "num-workers":
+                appconfig.set_default_num_workers(int(args.value))
+                print(f"default_num_workers → {args.value}")
+            elif args.config_set_cmd == "inference-backend":
+                try:
+                    appconfig.set_default_inference_backend(args.value)
+                    print(f"inference_backend → {args.value}")
+                except ValueError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    return 2
+            elif args.config_set_cmd == "export-format":
+                try:
+                    appconfig.set_default_export_format(args.value)
+                    print(f"export_format → {args.value}")
+                except ValueError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    return 2
+            print(f"Saved to: {appconfig.config_path()}")
             return 0
 
     print("Unknown command", file=sys.stderr)

@@ -4,11 +4,11 @@ import importlib.metadata
 import json
 import sys
 import os
-import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
+from .pathutil import resolve_path
 
 from .checkpoints import load_checkpoint_weights
 from .coco import (
@@ -69,7 +69,7 @@ def _package_version(dist_name: str) -> Optional[str]:
 
 def _summarize_training_outputs(out_dir: Path) -> None:
     try:
-        out_dir = out_dir.expanduser().resolve()
+        out_dir = resolve_path(out_dir)
     except Exception:
         return
 
@@ -220,7 +220,7 @@ def _write_deployment_bundle(out_dir: Path, dataset_dir: Path, cfg: TrainConfig,
 def _try_write_portable_checkpoint(out_dir: Path, *, checkpoint_key: Optional[str]) -> None:
     """Best-effort: write a weights-only checkpoint next to training outputs."""
     try:
-        out_dir = out_dir.expanduser().resolve()
+        out_dir = resolve_path(out_dir)
     except Exception:
         return
 
@@ -292,7 +292,7 @@ def train(cfg: TrainConfig) -> int:
     patch_default = os.name == "nt"
     patch_enabled = patch_default if cfg.patch_inference_mode is None else bool(cfg.patch_inference_mode)
 
-    dataset_dir = cfg.dataset_dir.expanduser().resolve()
+    dataset_dir = resolve_path(cfg.dataset_dir)
     if not dataset_dir.exists():
         print(f"Dataset folder not found: {dataset_dir}", file=sys.stderr)
         return 2
@@ -343,7 +343,7 @@ def train(cfg: TrainConfig) -> int:
                     )
                 return 4
 
-    out_dir = cfg.output_dir.expanduser().resolve() if cfg.output_dir else (dataset_dir / "models")
+    out_dir = resolve_path(cfg.output_dir) if cfg.output_dir else (dataset_dir / "models")
     out_dir.mkdir(parents=True, exist_ok=True)
     _archive_previous_error_trace(out_dir)
 

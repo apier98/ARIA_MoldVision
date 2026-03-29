@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+from .pathutil import resolve_path
 
 import numpy as np
 from PIL import Image
@@ -84,8 +85,8 @@ def quantize_onnx_model(
     if oq is None:
         raise ImportError("onnxruntime-quantization is required for quantization.")
 
-    model_path = model_path.expanduser().resolve()
-    output_path = output_path.expanduser().resolve()
+    model_path = resolve_path(model_path)
+    output_path = resolve_path(output_path)
 
     if calibration_data and len(calibration_data) > 0:
         if verbose:

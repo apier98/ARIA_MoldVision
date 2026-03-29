@@ -7,6 +7,12 @@ Config file location (platform-aware):
   Linux   : $XDG_CONFIG_HOME/moldvision/config.json  (default: ~/.config/moldvision/config.json)
 
 Environment variable overrides take precedence over config file values.
+
+Available settings (config.json keys / env vars):
+  default_dataset_root   MOLDVISION_DATASETS        Where 'dataset create' stores datasets
+  default_num_workers    MOLDVISION_NUM_WORKERS      DataLoader worker count (0 on Windows)
+  inference_backend      MOLDVISION_BACKEND          Default inference backend (auto/onnx/tensorrt/pytorch)
+  export_format          MOLDVISION_EXPORT_FORMAT    Default export format (onnx/tensorrt/onnx_fp16/onnx_quantized)
 """
 from __future__ import annotations
 
@@ -18,9 +24,16 @@ from typing import Any, Dict, Optional
 
 # Environment variable names
 ENV_DATASETS = "MOLDVISION_DATASETS"
+ENV_NUM_WORKERS = "MOLDVISION_NUM_WORKERS"
+ENV_BACKEND = "MOLDVISION_BACKEND"
+ENV_EXPORT_FORMAT = "MOLDVISION_EXPORT_FORMAT"
 
 _APP_NAME_WIN = "MoldVision"
 _APP_NAME_UNIX = "moldvision"
+
+# Canonical allowed values — used for validation in CLI
+VALID_BACKENDS = ("auto", "onnx", "tensorrt", "pytorch")
+VALID_EXPORT_FORMATS = ("onnx", "tensorrt", "onnx_fp16", "onnx_quantized")
 
 
 def config_dir() -> Path:
@@ -84,6 +97,97 @@ def set_default_dataset_root(path: str) -> None:
     """Persist a new default_dataset_root to the config file."""
     cfg = load_config()
     cfg["default_dataset_root"] = str(Path(path).expanduser())
+    save_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# num_workers
+# ---------------------------------------------------------------------------
+
+def get_default_num_workers() -> int:
+    """Return the default DataLoader worker count.
+
+    Priority: env var ``MOLDVISION_NUM_WORKERS`` → config file → OS heuristic.
+    On Windows multiprocessing with DataLoader is error-prone, so the OS
+    heuristic defaults to 0 there and 4 on Linux/macOS.
+    """
+    env = os.environ.get(ENV_NUM_WORKERS)
+    if env is not None:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    cfg = load_config()
+    val = cfg.get("default_num_workers")
+    if val is not None:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            pass
+    # OS heuristic
+    return 0 if sys.platform == "win32" else 4
+
+
+def set_default_num_workers(value: int) -> None:
+    """Persist the default DataLoader worker count."""
+    cfg = load_config()
+    cfg["default_num_workers"] = int(value)
+    save_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# inference_backend
+# ---------------------------------------------------------------------------
+
+def get_default_inference_backend() -> str:
+    """Return the preferred inference backend.
+
+    Priority: env var ``MOLDVISION_BACKEND`` → config file → ``"auto"``.
+    """
+    env = os.environ.get(ENV_BACKEND)
+    if env and env in VALID_BACKENDS:
+        return env
+    cfg = load_config()
+    val = cfg.get("inference_backend")
+    if val and val in VALID_BACKENDS:
+        return str(val)
+    return "auto"
+
+
+def set_default_inference_backend(value: str) -> None:
+    """Persist the preferred inference backend."""
+    if value not in VALID_BACKENDS:
+        raise ValueError(f"Unknown backend {value!r}. Choose from: {', '.join(VALID_BACKENDS)}")
+    cfg = load_config()
+    cfg["inference_backend"] = value
+    save_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# export_format
+# ---------------------------------------------------------------------------
+
+def get_default_export_format() -> str:
+    """Return the preferred export format.
+
+    Priority: env var ``MOLDVISION_EXPORT_FORMAT`` → config file → ``"onnx"``.
+    """
+    env = os.environ.get(ENV_EXPORT_FORMAT)
+    if env and env in VALID_EXPORT_FORMATS:
+        return env
+    cfg = load_config()
+    val = cfg.get("export_format")
+    if val and val in VALID_EXPORT_FORMATS:
+        return str(val)
+    return "onnx"
+
+
+def set_default_export_format(value: str) -> None:
+    """Persist the preferred export format."""
+    if value not in VALID_EXPORT_FORMATS:
+        raise ValueError(f"Unknown format {value!r}. Choose from: {', '.join(VALID_EXPORT_FORMATS)}")
+    cfg = load_config()
+    cfg["export_format"] = value
     save_config(cfg)
 
 

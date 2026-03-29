@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from .pathutil import resolve_path
 
 from .model_factory import instantiate_rfdetr_model
-from .deploy import (
+from .postprocess import (
     detections_to_json,
     filter_known_class_detections,
     letterbox_pil,
@@ -446,7 +447,7 @@ def _run_pytorch_inference(
     num_classes = int(len(class_names)) if class_names else None
 
     device_t = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    weights = (weights_path.expanduser().resolve() if weights_path else (bundle_dir / "checkpoint.pth"))
+    weights = (resolve_path(weights_path) if weights_path else (bundle_dir / "checkpoint.pth"))
     if not weights.exists():
         return InferResult(False, None, f"Weights not found: {weights}")
 
@@ -604,7 +605,7 @@ class InferenceEngine:
         backend: str = "auto",
         topk: Optional[int] = None,
     ):
-        self.bundle_dir = bundle_dir.expanduser().resolve()
+        self.bundle_dir = resolve_path(bundle_dir)
         self.cfg = load_bundle_config(self.bundle_dir)
         self.model_cfg = self.cfg.get("model_config.json", {}) or {}
         self.pre_cfg = self.cfg.get("preprocess.json", {}) or {}
@@ -621,7 +622,7 @@ class InferenceEngine:
         
         self.backend = str(backend or "auto").strip().lower()
         self.device_str = device
-        self.weights_path = weights_path.expanduser().resolve() if weights_path else (self.bundle_dir / "checkpoint.pth")
+        self.weights_path = resolve_path(weights_path) if weights_path else (self.bundle_dir / "checkpoint.pth")
         
         self.session = None
         self.model_wrapper = None

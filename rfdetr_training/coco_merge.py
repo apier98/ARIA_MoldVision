@@ -5,6 +5,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from .pathutil import resolve_path
+from .jsonutil import load_json_strict, save_json
 
 
 @dataclass(frozen=True)
@@ -13,14 +15,6 @@ class MergeResult:
     message: str
     images_added: int = 0
     annotations_added: int = 0
-
-
-def _load_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _write_json(path: Path, data: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _ensure_coco_skeleton(categories: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -117,9 +111,9 @@ def merge_coco_into_split(
     metadata_map: Optional[Dict[str, int]],
     dry_run: bool,
 ) -> MergeResult:
-    dataset_dir = dataset_dir.expanduser().resolve()
-    src_json = src_json.expanduser().resolve()
-    src_images_dir = src_images_dir.expanduser().resolve() if src_images_dir else None
+    dataset_dir = resolve_path(dataset_dir)
+    src_json = resolve_path(src_json)
+    src_images_dir = resolve_path(src_images_dir) if src_images_dir else None
 
     if split not in ("train", "valid", "test"):
         return MergeResult(False, f"Invalid split: {split}")

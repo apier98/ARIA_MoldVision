@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from .pathutil import resolve_path
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ def create_dataset(
     no_readme: bool,
     class_names: Optional[List[str]],
 ) -> DatasetLayout:
-    root = root.expanduser().resolve()
+    root = resolve_path(root)
     root.mkdir(parents=True, exist_ok=True)
 
     if uuid_str:
@@ -116,10 +117,16 @@ def find_images(raw_dir: Path, exts: List[str]) -> List[Path]:
 
 
 def image_size(img_path: Path) -> Tuple[int, int]:
+    """Return (width, height) for *img_path*, or (0, 0) on error."""
+    import warnings
     from PIL import Image  # type: ignore
 
-    with Image.open(img_path) as im:
-        return int(im.width), int(im.height)
+    try:
+        with Image.open(img_path) as im:
+            return int(im.width), int(im.height)
+    except Exception as exc:
+        warnings.warn(f"Could not read image size for {img_path}: {exc}")
+        return 0, 0
 
 
 def _read_yolo_labels_detect(label_path: Path) -> List[Tuple[int, float, float, float, float]]:
@@ -218,10 +225,10 @@ def yolo_to_coco(
     import random
     import shutil
 
-    dataset_dir = dataset_dir.expanduser().resolve()
-    raw_dir = raw_dir.expanduser().resolve() if raw_dir else (dataset_dir / "raw")
-    yolo_dir = yolo_dir.expanduser().resolve() if yolo_dir else (dataset_dir / "yolo")
-    coco_dir = out_dir.expanduser().resolve() if out_dir else (dataset_dir / "coco")
+    dataset_dir = resolve_path(dataset_dir)
+    raw_dir = resolve_path(raw_dir) if raw_dir else (dataset_dir / "raw")
+    yolo_dir = resolve_path(yolo_dir) if yolo_dir else (dataset_dir / "yolo")
+    coco_dir = resolve_path(out_dir) if out_dir else (dataset_dir / "coco")
 
     if not raw_dir.exists():
         raise FileNotFoundError(f"raw/ directory not found at {raw_dir}")

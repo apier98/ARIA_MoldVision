@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import json
 from datetime import datetime
 import shutil
+from .pathutil import resolve_path
+
+from .jsonutil import load_json_strict, save_json
 
 
 @dataclass(frozen=True)
@@ -23,10 +25,6 @@ class CocoPruneResult:
     removed_annotations: int = 0
     backup_path: Optional[Path] = None
     message: str = ""
-
-
-def _load_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _segmentation_is_nonempty(seg: object) -> bool:
@@ -110,7 +108,7 @@ def validate_coco_split(
         return CocoValidation(False, [f"Missing: {ann_path}"], [])
 
     try:
-        coco = _load_json(ann_path)
+        coco = load_json_strict(ann_path)
     except Exception as e:
         return CocoValidation(False, [f"Failed to parse {ann_path}: {e}"], [])
 
@@ -264,7 +262,7 @@ def prune_empty_masks_in_split(split_dir: Path, *, dry_run: bool = False) -> Coc
         return CocoPruneResult(False, message=f"Missing: {ann_path}")
 
     try:
-        coco = _load_json(ann_path)
+        coco = load_json_strict(ann_path)
     except Exception as e:
         return CocoPruneResult(False, message=f"Failed to parse {ann_path}: {e}")
 
@@ -341,7 +339,7 @@ def prune_empty_masks_in_split(split_dir: Path, *, dry_run: bool = False) -> Coc
 
     coco["images"] = kept_images
     coco["annotations"] = kept_anns2
-    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    save_json(ann_path, coco)
 
     return CocoPruneResult(
         True,
@@ -386,7 +384,7 @@ def prune_too_small_masks_in_split(
         return CocoPruneResult(False, message=f"Missing: {ann_path}")
 
     try:
-        coco = _load_json(ann_path)
+        coco = load_json_strict(ann_path)
     except Exception as e:
         return CocoPruneResult(False, message=f"Failed to parse {ann_path}: {e}")
 
@@ -501,7 +499,7 @@ def prune_too_small_masks_in_split(
 
     coco["images"] = kept_images
     coco["annotations"] = kept_anns2
-    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    save_json(ann_path, coco)
 
     return CocoPruneResult(
         True,
@@ -527,7 +525,7 @@ def ensure_minimal_test_split(coco_dir: Path) -> Optional[Path]:
         if not candidate.exists():
             continue
         try:
-            categories = _load_json(candidate).get("categories", []) or []
+            categories = load_json_strict(candidate).get("categories", []) or []
             break
         except Exception:
             continue
@@ -540,7 +538,7 @@ def ensure_minimal_test_split(coco_dir: Path) -> Optional[Path]:
         "annotations": [],
         "categories": categories,
     }
-    ann_path.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
+    save_json(ann_path, minimal)
     return ann_path
 
 
@@ -553,7 +551,7 @@ def _write_empty_split(ann_path: Path, *, categories: List[Dict[str, Any]]) -> N
         "annotations": [],
         "categories": categories,
     }
-    ann_path.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
+    save_json(ann_path, minimal)
 
 
 def reset_coco_dir(dataset_dir: Path, *, backup: bool = True) -> Tuple[bool, str]:
@@ -562,14 +560,14 @@ def reset_coco_dir(dataset_dir: Path, *, backup: bool = True) -> Tuple[bool, str
     This is useful when you ingested with the wrong label type (e.g. YOLO polygons but used detect),
     or when you want to start fresh without creating a new UUID.
     """
-    dataset_dir = dataset_dir.expanduser().resolve()
+    dataset_dir = resolve_path(dataset_dir)
     coco_dir = dataset_dir / "coco"
     md_path = dataset_dir / "METADATA.json"
 
     class_names: List[str] = []
     if md_path.exists():
         try:
-            md = _load_json(md_path)
+            md = load_json_strict(md_path)
             class_names = list(md.get("class_names", []) or [])
         except Exception:
             class_names = []
@@ -596,7 +594,7 @@ def normalize_coco_category_ids(ann_path: Path, *, dry_run: bool = False) -> Tup
     if not ann_path.exists():
         return False, f"Not found: {ann_path}"
 
-    coco = _load_json(ann_path)
+    coco = load_json_strict(ann_path)
     cats = coco.get("categories", []) or []
     anns = coco.get("annotations", []) or []
     if not isinstance(cats, list) or not isinstance(anns, list):
@@ -651,9 +649,9 @@ def normalize_coco_category_ids(ann_path: Path, *, dry_run: bool = False) -> Tup
 
     bak = ann_path.with_suffix(ann_path.suffix + ".bak")
     if not bak.exists():
-        bak.write_text(json.dumps(_load_json(ann_path), indent=2), encoding="utf-8")
+        save_json(bak, load_json_strict(ann_path))
 
-    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    save_json(ann_path, coco)
     return True, f"Normalized category ids in: {ann_path}"
 
 
@@ -667,7 +665,7 @@ def patch_coco_categories_supercategory(ann_path: Path, *, default: str = "") ->
         return False, f"Not found: {ann_path}"
 
     try:
-        coco = _load_json(ann_path)
+        coco = load_json_strict(ann_path)
     except Exception as e:
         return False, f"Failed to parse {ann_path}: {e}"
 
@@ -693,10 +691,10 @@ def patch_coco_categories_supercategory(ann_path: Path, *, default: str = "") ->
 
     bak = ann_path.with_suffix(ann_path.suffix + ".bak")
     if not bak.exists():
-        bak.write_text(json.dumps(_load_json(ann_path), indent=2), encoding="utf-8")
+        save_json(bak, load_json_strict(ann_path))
 
     coco["categories"] = new_cats
-    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    save_json(ann_path, coco)
     return True, f"Patched categories.supercategory in: {ann_path}"
 
 
@@ -711,7 +709,7 @@ def align_coco_categories_to_metadata(ann_path: Path, *, class_names: List[str],
         return False, "No class_names provided"
 
     try:
-        coco = _load_json(ann_path)
+        coco = load_json_strict(ann_path)
     except Exception as e:
         return False, f"Failed to parse {ann_path}: {e}"
 
@@ -764,11 +762,11 @@ def align_coco_categories_to_metadata(ann_path: Path, *, class_names: List[str],
 
     bak = ann_path.with_suffix(ann_path.suffix + ".bak")
     if not bak.exists():
-        bak.write_text(json.dumps(_load_json(ann_path), indent=2), encoding="utf-8")
+        save_json(bak, load_json_strict(ann_path))
 
     coco["categories"] = new_categories
     coco["annotations"] = anns
-    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    save_json(ann_path, coco)
     return True, f"Aligned categories to METADATA.json for: {ann_path} (remapped {remapped} annotations)"
 
 
@@ -790,7 +788,7 @@ def subsample_coco_split(
         return CocoPruneResult(False, message=f"Missing: {ann_path}")
 
     try:
-        coco = _load_json(ann_path)
+        coco = load_json_strict(ann_path)
     except Exception as e:
         return CocoPruneResult(False, message=f"Failed to parse {ann_path}: {e}")
 
@@ -916,7 +914,7 @@ def subsample_coco_split(
 
     coco["images"] = kept_images
     coco["annotations"] = kept_anns
-    ann_path.write_text(json.dumps(coco, indent=2), encoding="utf-8")
+    save_json(ann_path, coco)
 
     return CocoPruneResult(
         True,

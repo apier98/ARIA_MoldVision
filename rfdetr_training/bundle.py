@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from .pathutil import resolve_path
 
 from .datasets import load_metadata
 from .export import export_onnx, export_tensorrt_from_onnx, quantize_onnx
@@ -159,7 +160,7 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def load_bundle(bundle_dir: Path) -> Dict[str, Any]:
-    bundle_dir = bundle_dir.expanduser().resolve()
+    bundle_dir = resolve_path(bundle_dir)
     cfg = {
         "bundle_dir": str(bundle_dir),
         "model_config": _read_json(bundle_dir / "model_config.json"),
@@ -404,7 +405,7 @@ def main() -> int:
     ap.add_argument("--topk", type=int, default=300)
     args = ap.parse_args()
 
-    bundle_dir = Path(args.bundle_dir).expanduser().resolve()
+    bundle_dir = resolve_path(args.bundle_dir)
     cfg = load_bundle(bundle_dir)
     model_cfg = cfg.get("model_config", {}) or {}
     pre_cfg = cfg.get("preprocess", {}) or {}
@@ -423,7 +424,7 @@ def main() -> int:
     policy = (pre_cfg.get("resize_policy") or pre_cfg.get("policy") or "letterbox").strip().lower()
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    weights_path = Path(args.weights).expanduser().resolve() if args.weights else (bundle_dir / "checkpoint.pth")
+    weights_path = resolve_path(args.weights) if args.weights else (bundle_dir / "checkpoint.pth")
     if not weights_path.exists():
         raise SystemExit(f"Weights not found: {weights_path}")
 
@@ -505,8 +506,8 @@ def create_bundle(
     calibration_split: str = "valid",
     calibration_count: int = 100,
 ) -> BundleResult:
-    dataset_dir = dataset_dir.expanduser().resolve()
-    weights = weights.expanduser().resolve()
+    dataset_dir = resolve_path(dataset_dir)
+    weights = resolve_path(weights)
     if not dataset_dir.exists():
         return BundleResult(False, None, f"Dataset dir not found: {dataset_dir}")
     if not weights.exists():
@@ -526,7 +527,7 @@ def create_bundle(
             trained_model_cfg = {}
 
     # Decide bundle output directory.
-    bundle_dir = (output_dir.expanduser().resolve() if output_dir else _default_bundle_dir(dataset_dir, weights=weights))
+    bundle_dir = (resolve_path(output_dir) if output_dir else _default_bundle_dir(dataset_dir, weights=weights))
     if bundle_dir.exists():
         if not overwrite:
             return BundleResult(False, None, f"Output already exists: {bundle_dir} (use --overwrite)")

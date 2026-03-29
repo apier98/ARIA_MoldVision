@@ -6,6 +6,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from .pathutil import resolve_path
 
 from .coco import align_coco_categories_to_metadata, patch_coco_categories_supercategory
 from .coco_merge import merge_coco_into_split
@@ -126,7 +127,7 @@ def ingest_labels_inbox(
     include_background: bool,
     dry_run: bool,
 ) -> IngestResult:
-    dataset_dir = dataset_dir.expanduser().resolve()
+    dataset_dir = resolve_path(dataset_dir)
     inbox = dataset_dir / "labels_inbox"
     quarantine = inbox / "quarantine"
 
