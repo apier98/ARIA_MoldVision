@@ -126,7 +126,7 @@ def draw_mask_contours(frame: np.ndarray, masks: List[np.ndarray], labels: List[
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run RF-DETR inference on a single image and overlay masks")
+    p = argparse.ArgumentParser(description="ARIA_MoldVision: Run inference on a single image and overlay masks")
     p.add_argument("--image", "-i", required=True, help="Path to image file")
     p.add_argument("--weights", "-w", required=True, help="Path to model checkpoint (.pth)")
     p.add_argument("--task", choices=["detect", "seg"], default="seg", help="Task: detect or seg (default: seg)")
@@ -671,7 +671,7 @@ def main():
             if args.verbose:
                 print(f"Scaled display to width={args.width}, height={new_h}")
 
-        cv2.imshow("Inference", disp_to_show)
+        cv2.imshow("ARIA_MoldVision", disp_to_show)
         print("Press any key in the image window to exit")
         cv2.waitKey(0)
         cv2.destroyAllWindows()

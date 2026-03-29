@@ -36,7 +36,7 @@ import torchvision.transforms as T
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Webcam inference for RF-DETR models (display only)")
+    p = argparse.ArgumentParser(description="ARIA_MoldVision: Webcam inference (display only)")
     p.add_argument("--camera", "-c", type=int, default=0, help="webcam index (0,1,...)")
     p.add_argument("--weights", "-w", type=str, default=None, help="path to model weights (checkpoint .pth)")
 
@@ -796,7 +796,7 @@ def main():
                 scale = args.width / disp.shape[1]
                 disp = cv2.resize(disp, (args.width, int(disp.shape[0] * scale)))
 
-            cv2.imshow("RF-DETR Inference (press q to quit)", disp)
+            cv2.imshow("ARIA_MoldVision (press q to quit)", disp)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break

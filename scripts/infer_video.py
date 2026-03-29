@@ -32,7 +32,7 @@ import numpy as np
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run RF-DETR inference on a video file")
+    p = argparse.ArgumentParser(description="ARIA_MoldVision: Run inference on a video file")
     p.add_argument("--video", "-i", required=True, help="input video path")
     p.add_argument("--weights", "-w", required=True, help="path to model weights (.pth)")
     p.add_argument("--task", choices=["detect", "seg"], default="detect", help="inference task")
@@ -318,7 +318,7 @@ def main():
                 if args.width and args.width > 0 and shown.shape[1] != args.width:
                     scale = float(args.width) / float(shown.shape[1])
                     shown = cv2.resize(shown, (args.width, int(shown.shape[0] * scale)), interpolation=cv2.INTER_AREA)
-                cv2.imshow("RF-DETR Video Inference (press q to quit)", shown)
+                cv2.imshow("ARIA_MoldVision Video Inference (press q to quit)", shown)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
 

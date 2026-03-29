@@ -83,7 +83,7 @@ def _load_trained_model_config(dataset_dir: Path) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="rfdetrw", description="RF-DETR training workspace (CLI)")
+    p = argparse.ArgumentParser(prog="moldvision", description="ARIA_MoldVision: Defect Detection workspace (CLI)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # doctor

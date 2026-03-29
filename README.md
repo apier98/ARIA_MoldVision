@@ -1,6 +1,6 @@
-# RF-DETR Training Workspace
+# ARIA_MoldVision
 
-This repo is a CLI-first workspace to prepare datasets and train RF-DETR models using the `rfdetr` Python package.
+Integrated system for defect detection models, from dataset preparation to training and deployment.
 
 ## What you can do
 
@@ -11,7 +11,7 @@ Core (supported) CLI:
 - Validate COCO splits before training
 - Subsample COCO splits (stratified by class + proportional background)
 - Normalize COCO category ids to contiguous `0..N-1` (fixes common training issues)
-- Train RF-DETR models (detect or seg)
+- Train defect detection models (detect or seg)
 - Export trained models to ONNX (and optionally build TensorRT engines)
 - Run `doctor` to check your environment and print common fix hints
 
@@ -20,7 +20,7 @@ Core (supported) CLI:
 Run the CLI from the repo:
 
 - `python -m rfdetr_training --help`
-- `python scripts/rfdetrw.py --help`
+- `moldvision --help` (if installed)
 
 ## Typical workflow
 

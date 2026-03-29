@@ -402,7 +402,7 @@ def main() -> int:
                     writer.write(disp)
                 
                 if args.display:
-                    cv2.imshow("RF-DETR Inference", disp)
+                    cv2.imshow("ARIA_MoldVision Inference", disp)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
         finally:
@@ -417,3 +417,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+)

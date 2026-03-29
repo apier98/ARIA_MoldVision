@@ -389,8 +389,9 @@ def draw_overlay(pil: Image.Image, dets: List[Dict[str, Any]]) -> Image.Image:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Run inference using a portable RF-DETR bundle directory")
-    ap.add_argument("--bundle-dir", default=".", help="Bundle directory (contains checkpoint.pth + *config.json)")
+    ap = argparse.ArgumentParser(description="ARIA_MoldVision: Run inference using a portable deployment bundle")
+    ap.add_argument("--bundle-dir", default=".", help="Bundle directory (contains model.onnx/checkpoint.pth + *config.json)")
+
     ap.add_argument("--image", "-i", required=True, help="Path to an image")
     ap.add_argument("--weights", default=None, help="Override weights path (default: bundle/checkpoint.pth)")
     ap.add_argument("--device", default=None, help="cuda, cuda:0, cpu (default: auto)")

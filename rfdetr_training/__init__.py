@@ -1,2 +1,2 @@
-"""RF-DETR training workspace helpers (CLI-first)."""
+"""ARIA_MoldVision training workspace helpers (CLI-first)."""
 
