@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import List
 
+from . import appconfig
 from .coco import (
     align_coco_categories_to_metadata,
     ensure_minimal_test_split,
@@ -226,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ds_create = ds_sub.add_parser("create", help="Create a dataset UUID folder")
     ds_create.add_argument("--uuid", "-u", default=None)
-    ds_create.add_argument("--root", "-r", default="datasets")
+    ds_create.add_argument("--root", "-r", default=None, help="Root directory for new datasets (default: resolved from config/env)")
     ds_create.add_argument("--name", "-n", default=None)
     ds_create.add_argument("--force", "-f", action="store_true")
     ds_create.add_argument("--no-readme", action="store_true")
@@ -431,6 +432,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable inference_mode patch (if auto-enabled)",
     )
     tr.add_argument("--no-validate", action="store_true", help="Skip dataset validation checks")
+
+    # config
+    cfg_p = sub.add_parser("config", help="View or edit persistent MoldVision settings")
+    cfg_sub = cfg_p.add_subparsers(dest="config_cmd", required=True)
+
+    cfg_sub.add_parser("show", help="Print all current settings and their effective values")
+
+    cfg_set = cfg_sub.add_parser("set", help="Persist a setting to the config file")
+    cfg_set_sub = cfg_set.add_subparsers(dest="config_set_cmd", required=True)
+
+    cfg_ds = cfg_set_sub.add_parser("dataset-root", help="Set the default dataset root directory")
+    cfg_ds.add_argument("path", help="Absolute or ~ path to use as the default dataset root")
+
     return p
 
 
@@ -470,6 +484,18 @@ def main(argv: List[str] | None = None) -> int:
         except Exception as e:
             print(f"- rfdetr: not importable ({e})")
 
+        print(f"- config file: {appconfig.config_path()}")
+        default_root = appconfig.get_default_dataset_root()
+        env_override = os.environ.get(appconfig.ENV_DATASETS)
+        if env_override:
+            print(f"- default dataset root: {default_root}  (from env {appconfig.ENV_DATASETS})")
+        else:
+            file_root = appconfig.load_config().get("default_dataset_root")
+            if file_root:
+                print(f"- default dataset root: {default_root}  (from config file)")
+            else:
+                print(f"- default dataset root: {default_root}  (fallback; use 'moldvision config set dataset-root <path>' to change)")
+
         if os.name == "nt":
             print("- hint: on Windows, set --num-workers 0 to avoid multiprocessing issues")
         print("- hint: if you see 'Inference tensors cannot be saved for backward', enable --patch-inference-mode")
@@ -482,8 +508,9 @@ def main(argv: List[str] | None = None) -> int:
     if args.cmd == "dataset" and args.dataset_cmd == "create":
         try:
             classes = _parse_classes(args.classes, args.classes_file)
+            root = Path(args.root) if args.root else Path(appconfig.get_default_dataset_root())
             layout = create_dataset(
-                root=Path(args.root),
+                root=root,
                 uuid_str=args.uuid,
                 name=args.name,
                 force=bool(args.force),
@@ -999,6 +1026,34 @@ def main(argv: List[str] | None = None) -> int:
         else:
             print(json.dumps(res.payload, indent=2))
         return 0
+
+    if args.cmd == "config":
+        if args.config_cmd == "show":
+            cfg_data = appconfig.load_config()
+            effective_root = appconfig.get_default_dataset_root()
+            env_override = os.environ.get(appconfig.ENV_DATASETS)
+            print(f"Config file : {appconfig.config_path()}")
+            print(f"Config exists: {appconfig.config_path().exists()}")
+            print()
+            print("Effective settings:")
+            if env_override:
+                print(f"  default_dataset_root = {effective_root}  [env: {appconfig.ENV_DATASETS}]")
+            else:
+                src = "(config file)" if cfg_data.get("default_dataset_root") else "(fallback default)"
+                print(f"  default_dataset_root = {effective_root}  {src}")
+            if cfg_data:
+                print()
+                print("Stored config (raw):")
+                for k, v in cfg_data.items():
+                    print(f"  {k} = {v!r}")
+            return 0
+
+        if args.config_cmd == "set" and args.config_set_cmd == "dataset-root":
+            resolved = str(Path(args.path).expanduser())
+            appconfig.set_default_dataset_root(resolved)
+            print(f"default_dataset_root set to: {resolved}")
+            print(f"Config file: {appconfig.config_path()}")
+            return 0
 
     print("Unknown command", file=sys.stderr)
     return 2
