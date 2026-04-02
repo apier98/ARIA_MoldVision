@@ -158,6 +158,19 @@ def handle_dataset_create(args) -> int:
 
 
 def handle_dataset_yolo_to_coco(args) -> int:
+    print(
+        "Note: Label Studio exports YOLO files with class IDs sorted ALPHABETICALLY by label name,\n"
+        "  regardless of the order shown in the Label Studio UI.\n"
+        "  Example: if your classes are Component_Base, Weld_Line, Sink_Mark, Label Studio assigns\n"
+        "    class 0 = Component_Base, class 1 = Sink_Mark, class 2 = Weld_Line  (alphabetical)\n"
+        "  while METADATA.json might have them in a different (non-alphabetical) order.\n"
+        "  Fix: in your Label Studio labeling config, add category=\"N\" to pin each label to its ID:\n"
+        "    <Label value=\"Component_Base\" category=\"0\"/>\n"
+        "    <Label value=\"Weld_Line\"      category=\"1\"/>\n"
+        "    <Label value=\"Sink_Mark\"      category=\"2\"/>\n"
+        "  Verify: compare METADATA.json class_names order with the order in a YOLO .txt file\n"
+        "  before training to avoid silent class swaps."
+    )
     exts = [e.strip().lower() for e in args.images_ext.split(",") if e.strip()]
     try:
         yolo_to_coco(

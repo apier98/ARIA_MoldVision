@@ -119,9 +119,9 @@ Label Studio runs at `http://localhost:8080`. Create an account on first launch.
 <View>
   <Image name="image" value="$image"/>
   <RectangleLabels name="label" toName="image">
-    <Label value="scratch" background="#FF0000"/>
-    <Label value="dent" background="#00FF00"/>
-    <Label value="stain" background="#0000FF"/>
+    <Label value="scratch" background="#FF0000" category="0"/>
+    <Label value="dent"    background="#00FF00" category="1"/>
+    <Label value="stain"   background="#0000FF" category="2"/>
   </RectangleLabels>
 </View>
 ```
@@ -132,18 +132,29 @@ Label Studio runs at `http://localhost:8080`. Create an account on first launch.
 <View>
   <Image name="image" value="$image"/>
   <RectangleLabels name="label" toName="image">
-    <Label value="scratch"/>
-    <Label value="dent"/>
+    <Label value="scratch" category="0"/>
+    <Label value="dent"    category="1"/>
   </RectangleLabels>
   <PolygonLabels name="mask" toName="image">
-    <Label value="scratch"/>
-    <Label value="dent"/>
+    <Label value="scratch" category="0"/>
+    <Label value="dent"    category="1"/>
   </PolygonLabels>
 </View>
 ```
 
 Replace label names with your actual class names. They **must match** the class
 names used when training the model.
+
+> ⚠️ **Label Studio YOLO export sorts class IDs alphabetically by label name**,
+> regardless of the order labels appear in the UI.  For example, classes
+> `Component_Base`, `Weld_Line`, `Sink_Mark` would be exported as
+> class 0 = `Component_Base`, class 1 = `Sink_Mark`, class 2 = `Weld_Line`
+> (alphabetical), not the order you see in the UI.
+>
+> **Always add `category="N"` to every `<Label>` tag** (as shown above) to pin
+> each label to its intended class ID.  Without this attribute, YOLO exports will
+> silently assign wrong class IDs whenever your labels are not already in
+> alphabetical order.
 
 ---
 
@@ -253,6 +264,7 @@ but higher-confidence ones.
 | Problem | Solution |
 |---|---|
 | Backend returns empty predictions | Check `MOLDVISION_BUNDLE_DIR` is set and points to a valid bundle directory |
+| Classes appear swapped in inference / visualization | Label Studio exports YOLO with **alphabetical** class IDs. Add `category="N"` to every `<Label>` in your labeling config and re-export. See Step 5. |
 | Label names don't match in UI | Ensure your Label Studio label config uses exactly the same class names as your training dataset |
 | `cv2` not found (seg masks missing) | Run `pip install opencv-python-headless` |
 | `CUDA` provider warnings | Install `onnxruntime-gpu` instead of `onnxruntime` for GPU inference |
@@ -310,9 +322,9 @@ Bounding box detection:
 <View>
   <Image name="image" value="$image"/>
   <RectangleLabels name="label" toName="image">
-    <Label value="scratch" background="#FF0000"/>
-    <Label value="dent"    background="#00FF00"/>
-    <Label value="stain"   background="#0000FF"/>
+    <Label value="scratch" background="#FF0000" category="0"/>
+    <Label value="dent"    background="#00FF00" category="1"/>
+    <Label value="stain"   background="#0000FF" category="2"/>
   </RectangleLabels>
 </View>
 ```
@@ -323,18 +335,23 @@ Instance segmentation (bounding boxes + polygon masks):
 <View>
   <Image name="image" value="$image"/>
   <RectangleLabels name="label" toName="image">
-    <Label value="scratch"/>
-    <Label value="dent"/>
+    <Label value="scratch" category="0"/>
+    <Label value="dent"    category="1"/>
   </RectangleLabels>
   <PolygonLabels name="mask" toName="image">
-    <Label value="scratch"/>
-    <Label value="dent"/>
+    <Label value="scratch" category="0"/>
+    <Label value="dent"    category="1"/>
   </PolygonLabels>
 </View>
 ```
 
 Replace label names with your actual class names — they must match what you
 pass to `moldvision dataset create -c`.
+
+> ⚠️ **Always add `category="N"` to every `<Label>` tag** to prevent silent
+> class ID swaps.  Without it, Label Studio assigns YOLO class IDs
+> **alphabetically**, which will silently swap classes whose names are not in
+> alphabetical order.
 
 **3. Import images and annotate**
 
@@ -373,6 +390,12 @@ Each `.txt` file must have one row per annotation:
 ```
 All values are normalised to `[0, 1]`. The class order must match the order of
 classes in your dataset's `METADATA.json`.
+
+> ⚠️ **If you exported from Label Studio in YOLO format**, be aware that Label
+> Studio assigns class IDs **alphabetically** unless you pin them with
+> `category="N"` in your labeling config (see Step 5).  Always verify that the
+> class IDs in the `.txt` files match the order in `METADATA.json` before
+> running `moldvision dataset ingest` or `yolo-to-coco`.
 
 ```powershell
 # Place images and .txt files together
