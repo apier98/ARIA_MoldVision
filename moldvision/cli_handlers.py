@@ -1087,7 +1087,18 @@ def handle_lake(args) -> int:
 
 
 def _handle_lake_init(args) -> int:
-    from .lake import init_lake
+    from .lake import LakeConfig, init_lake
+    root = Path(args.root) if getattr(args, "root", None) else LakeConfig.default_root()
+    already_exists = (root / "data_lake_config.json").exists()
+    cfg = init_lake(root)
+    if already_exists:
+        print(f"Lake already initialised — refreshed skeleton at: {cfg.root}")
+    else:
+        print(f"Lake initialised at: {cfg.root}")
+    print(f"  Config : {cfg.root / 'data_lake_config.json'}")
+    print(f"  Index  : {cfg.root / 'image_index.jsonl'}")
+    print(f"  Tip    : set ARIA_DATA_LAKE={cfg.root} (or use --lake-root on every command)")
+    return 0
 
 
 def _handle_lake_external_import(args) -> int:
