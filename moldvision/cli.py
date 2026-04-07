@@ -414,6 +414,141 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_ef = cfg_set_sub.add_parser("export-format", help="Set the default export format")
     cfg_ef.add_argument("value", choices=list(appconfig.VALID_EXPORT_FORMATS), help="Format name")
 
+    # -------------------------------------------------------------------------
+    # lake  (ARIA Data Lake management)
+    # -------------------------------------------------------------------------
+    lk = sub.add_parser("lake", help="ARIA Data Lake: session import, labeling, pull, model registry")
+    lk_sub = lk.add_subparsers(dest="lake_cmd", required=True)
+
+    # lake init
+    lk_init = lk_sub.add_parser("init", help="Initialise a new data lake at the given path")
+    lk_init.add_argument("--root", default=None, help="Lake root directory (default: ARIA_DATA_LAKE env or platform default)")
+
+    # lake session
+    lk_sess = lk_sub.add_parser("session", help="Session-level commands (import, list)")
+    lk_sess_sub = lk_sess.add_subparsers(dest="lake_session_cmd", required=True)
+
+    lk_imp = lk_sess_sub.add_parser("import", help="Import a qual session's raw frames into the lake")
+    lk_imp.add_argument("--session-meta", required=True, help="Path to session JSON (MoldPilot manifest or MoldTrace session.json)")
+    lk_imp.add_argument("--inspection-frames", default=None, help="Directory of extracted inspection JPEGs")
+    lk_imp.add_argument("--monitor-frames", default=None, help="Directory of extracted monitor JPEGs")
+    lk_imp.add_argument("--overwrite", action="store_true", help="Overwrite if session already exists")
+    lk_imp.add_argument("--lake-root", default=None, help="Override lake root path")
+
+    lk_lst = lk_sess_sub.add_parser("list", help="List sessions with frame and annotation coverage")
+    lk_lst.add_argument("--machine-id", default=None)
+    lk_lst.add_argument("--mold-id", default=None)
+    lk_lst.add_argument("--part-id", default=None)
+    lk_lst.add_argument("--from", dest="from_date", default=None, metavar="DATE", help="Filter sessions starting on or after DATE (ISO-8601)")
+    lk_lst.add_argument("--to", dest="to_date", default=None, metavar="DATE", help="Filter sessions starting on or before DATE (ISO-8601)")
+    lk_lst.add_argument("--task", choices=["detect", "seg"], default=None, help="Show coverage for this task")
+    lk_lst.add_argument("--label-status", choices=["labeled", "unlabeled", "any"], default=None)
+    lk_lst.add_argument("--marker", default=None, help="Only sessions containing this marker text")
+    lk_lst.add_argument("--min-frames", type=int, default=0, help="Minimum total frames to include a session")
+    lk_lst.add_argument("--lake-root", default=None)
+
+    # lake label-batch
+    lk_lb = lk_sub.add_parser("label-batch", help="Labeling batch commands (create, commit, status)")
+    lk_lb_sub = lk_lb.add_subparsers(dest="lake_label_batch_cmd", required=True)
+
+    lk_lbc = lk_lb_sub.add_parser("create", help="Select frames from the lake and create a Label Studio batch")
+    lk_lbc.add_argument("--task", choices=["detect", "seg"], required=True)
+    lk_lbc.add_argument("--sessions", default=None, help="Comma-separated session IDs")
+    lk_lbc.add_argument("--all", dest="all_sessions", action="store_true", help="Include all sessions")
+    lk_lbc.add_argument("--machine-id", default=None)
+    lk_lbc.add_argument("--mold-id", default=None)
+    lk_lbc.add_argument("--marker", default=None)
+    lk_lbc.add_argument("--only-unlabeled", dest="only_unlabeled", action="store_true", default=True)
+    lk_lbc.add_argument("--include-labeled", dest="only_unlabeled", action="store_false",
+                        help="Include already-labeled frames in selection pool")
+    lk_lbc.add_argument("--n", type=int, default=200, help="Total frames to select across sessions (default: 200)")
+    lk_lbc.add_argument("--sample-mode", choices=["random", "temporal"], default="random",
+                        help="Frame selection strategy (default: random)")
+    lk_lbc.add_argument("--min-frame-gap", type=int, default=1,
+                        help="Minimum frame_idx gap between selected frames (avoids near-duplicates, default: 1)")
+    lk_lbc.add_argument("--skip-first", type=int, default=0, help="Skip first N frames per session (startup noise)")
+    lk_lbc.add_argument("--skip-last", type=int, default=0, help="Skip last N frames per session (teardown noise)")
+    lk_lbc.add_argument("--seed", type=int, default=42)
+    lk_lbc.add_argument("--batch-name", default=None, help="Human-readable batch name (used as ID prefix)")
+    lk_lbc.add_argument("--lake-root", default=None)
+
+    lk_lbk = lk_lb_sub.add_parser("commit", help="Commit a Label Studio COCO export back into the lake")
+    lk_lbk.add_argument("--batch", required=True, dest="batch_id", help="Batch ID to commit")
+    lk_lbk.add_argument("--coco-json", default=None, help="Explicit path to COCO JSON (default: auto-detect in batch/export/)")
+    lk_lbk.add_argument("--dry-run", action="store_true")
+    lk_lbk.add_argument("--lake-root", default=None)
+
+    lk_lbs = lk_lb_sub.add_parser("status", help="List all label batches and their status")
+    lk_lbs.add_argument("--task", choices=["detect", "seg"], default=None)
+    lk_lbs.add_argument("--lake-root", default=None)
+
+    # lake pull
+    lk_pull = lk_sub.add_parser("pull", help="Build a balanced training dataset from labeled lake images")
+    lk_pull.add_argument("--task", choices=["detect", "seg"], required=True)
+    lk_pull.add_argument("--sessions", default=None, help="Comma-separated session IDs")
+    lk_pull.add_argument("--all", dest="all_sessions", action="store_true")
+    lk_pull.add_argument("--machine-id", default=None)
+    lk_pull.add_argument("--mold-id", default=None)
+    lk_pull.add_argument("--part-id", default=None)
+    lk_pull.add_argument("--from", dest="from_date", default=None, metavar="DATE")
+    lk_pull.add_argument("--to", dest="to_date", default=None, metavar="DATE")
+    lk_pull.add_argument("--marker", default=None)
+    lk_pull.add_argument("--include-hard-negatives", action="store_true")
+    lk_pull.add_argument("--include-backgrounds", action="store_true")
+    lk_pull.add_argument("--max-per-session", type=int, default=None)
+    lk_pull.add_argument("--min-per-session", type=int, default=0)
+    lk_pull.add_argument("--balance-classes", action="store_true")
+    lk_pull.add_argument("--min-per-class", type=int, default=None)
+    lk_pull.add_argument("--train-ratio", type=float, default=0.8)
+    lk_pull.add_argument("--seed", type=int, default=42)
+    lk_pull.add_argument("--dataset-uuid", default=None)
+    lk_pull.add_argument("--dataset-name", default=None)
+    lk_pull.add_argument("--dataset-root", default=None, help="Override dataset output root (default: <lake>/datasets/)")
+    lk_pull.add_argument("--dry-run", action="store_true")
+    lk_pull.add_argument("--lake-root", default=None)
+
+    # lake index
+    lk_idx = lk_sub.add_parser("index", help="Manage the image_index.jsonl catalogue")
+    lk_idx_grp = lk_idx.add_mutually_exclusive_group(required=True)
+    lk_idx_grp.add_argument("--rebuild", action="store_true", help="Full scan → rewrite image_index.jsonl")
+    lk_idx_grp.add_argument("--stats", action="store_true", help="Print per-session coverage statistics")
+    lk_idx.add_argument("--task", choices=["detect", "seg"], default=None)
+    lk_idx.add_argument("--lake-root", default=None)
+
+    # lake models
+    lk_mod = lk_sub.add_parser("models", help="Model registry commands (install, list, promote)")
+    lk_mod_sub = lk_mod.add_subparsers(dest="lake_models_cmd", required=True)
+
+    lk_mi = lk_mod_sub.add_parser("install", help="Install a .mpk bundle into the registry")
+    lk_mi.add_argument("bundle", help="Path to .mpk file")
+    lk_mi.add_argument("--task", choices=["detect", "seg"], required=True)
+    lk_mi.add_argument("--lake-root", default=None)
+
+    lk_ml = lk_mod_sub.add_parser("list", help="List installed model bundles")
+    lk_ml.add_argument("--task", choices=["detect", "seg"], default=None)
+    lk_ml.add_argument("--lake-root", default=None)
+
+    lk_mp = lk_mod_sub.add_parser("promote", help="Set a bundle as the active model for a channel")
+    lk_mp.add_argument("bundle_id", help="Bundle ID to promote")
+    lk_mp.add_argument("--task", choices=["detect", "seg"], required=True)
+    lk_mp.add_argument("--channel", choices=["stable", "dev"], required=True)
+    lk_mp.add_argument("--lake-root", default=None)
+
+    # lake pools
+    lk_pools = lk_sub.add_parser("pools", help="Manage hard-negative and background pools")
+    lk_pools_sub = lk_pools.add_subparsers(dest="lake_pools_cmd", required=True)
+
+    lk_phn = lk_pools_sub.add_parser("add-hard-negative", help="Add image(s) to the hard-negatives pool")
+    lk_phn.add_argument("--image", action="append", default=[], dest="images",
+                        help="Relative path to image in the lake (can be repeated)")
+    lk_phn.add_argument("--reason", default="", help="Why this is a hard negative (e.g. 'model_false_positive')")
+    lk_phn.add_argument("--lake-root", default=None)
+
+    lk_pbg = lk_pools_sub.add_parser("add-background", help="Add image(s) to the backgrounds pool")
+    lk_pbg.add_argument("--image", action="append", default=[], dest="images",
+                        help="Relative path to image in the lake (can be repeated)")
+    lk_pbg.add_argument("--lake-root", default=None)
+
     return p
 
 
@@ -447,6 +582,9 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.cmd == "config":
         return cli_handlers.handle_config(args)
+
+    if args.cmd == "lake":
+        return cli_handlers.handle_lake(args)
 
     build_parser().parse_args(["--help"])
     return 2

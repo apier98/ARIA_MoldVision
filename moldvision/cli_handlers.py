@@ -1022,3 +1022,326 @@ def handle_config(args) -> int:
         return 0
 
     return 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# lake command dispatcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _lake_cfg(args) -> "LakeConfig":  # type: ignore[name-defined]
+    from .lake import LakeConfig
+    override = Path(args.lake_root) if getattr(args, "lake_root", None) else None
+    return LakeConfig.find(override)
+
+
+def handle_lake(args) -> int:
+    lake_cmd = getattr(args, "lake_cmd", None)
+
+    if lake_cmd == "init":
+        return _handle_lake_init(args)
+
+    if lake_cmd == "session":
+        sub = getattr(args, "lake_session_cmd", None)
+        if sub == "import":
+            return _handle_lake_session_import(args)
+        if sub == "list":
+            return _handle_lake_session_list(args)
+
+    if lake_cmd == "label-batch":
+        sub = getattr(args, "lake_label_batch_cmd", None)
+        if sub == "create":
+            return _handle_lake_label_batch_create(args)
+        if sub == "commit":
+            return _handle_lake_label_batch_commit(args)
+        if sub == "status":
+            return _handle_lake_label_batch_status(args)
+
+    if lake_cmd == "pull":
+        return _handle_lake_pull(args)
+
+    if lake_cmd == "index":
+        return _handle_lake_index(args)
+
+    if lake_cmd == "models":
+        sub = getattr(args, "lake_models_cmd", None)
+        if sub == "install":
+            return _handle_lake_models_install(args)
+        if sub == "list":
+            return _handle_lake_models_list(args)
+        if sub == "promote":
+            return _handle_lake_models_promote(args)
+
+    if lake_cmd == "pools":
+        sub = getattr(args, "lake_pools_cmd", None)
+        if sub == "add-hard-negative":
+            return _handle_lake_pools_add(args, pool="hard_negatives")
+        if sub == "add-background":
+            return _handle_lake_pools_add(args, pool="backgrounds")
+
+    from . import cli as _cli
+    _cli.build_parser().parse_args(["lake", "--help"])
+    return 2
+
+
+def _handle_lake_init(args) -> int:
+    from .lake import init_lake
+    root_arg = getattr(args, "root", None)
+    from .lake import LakeConfig
+    root = Path(root_arg) if root_arg else LakeConfig.default_root()
+    try:
+        cfg = init_lake(root)
+        print(f"Data lake initialised at: {cfg.root}")
+        print(f"Config: {cfg.root / 'data_lake_config.json'}")
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_session_import(args) -> int:
+    from .lake import LakeConfig
+    from .lake import session_import
+    cfg = _lake_cfg(args)
+    try:
+        result = session_import(
+            cfg,
+            session_meta_path=Path(args.session_meta),
+            inspection_frames_dir=Path(args.inspection_frames) if args.inspection_frames else None,
+            monitor_frames_dir=Path(args.monitor_frames) if args.monitor_frames else None,
+            overwrite=bool(args.overwrite),
+        )
+        verb = "Updated" if result.already_existed else "Imported"
+        print(f"{verb} session: {result.session_id}")
+        print(f"  Inspection frames: {result.inspection_frames_added}")
+        print(f"  Monitor frames:    {result.monitor_frames_added}")
+        return 0
+    except FileExistsError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_session_list(args) -> int:
+    from .lake import session_list
+    cfg = _lake_cfg(args)
+    try:
+        label_status = getattr(args, "label_status", None)
+        if label_status == "any":
+            label_status = None
+        session_list(
+            cfg,
+            machine_id=getattr(args, "machine_id", None),
+            mold_id=getattr(args, "mold_id", None),
+            part_id=getattr(args, "part_id", None),
+            from_date=getattr(args, "from_date", None),
+            to_date=getattr(args, "to_date", None),
+            task=getattr(args, "task", None),
+            label_status=label_status,
+            marker=getattr(args, "marker", None),
+            min_frames=getattr(args, "min_frames", 0) or 0,
+        )
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_label_batch_create(args) -> int:
+    from .lake_label import label_batch_create
+    cfg = _lake_cfg(args)
+    sessions = [s.strip() for s in args.sessions.split(",") if s.strip()] if args.sessions else None
+    try:
+        label_batch_create(
+            cfg,
+            task=args.task,
+            sessions=sessions,
+            all_sessions=bool(args.all_sessions),
+            machine_id=getattr(args, "machine_id", None),
+            mold_id=getattr(args, "mold_id", None),
+            marker=getattr(args, "marker", None),
+            only_unlabeled=bool(args.only_unlabeled),
+            n=int(args.n),
+            sample_mode=args.sample_mode,
+            min_frame_gap=int(args.min_frame_gap),
+            skip_first=int(args.skip_first),
+            skip_last=int(args.skip_last),
+            seed=int(args.seed),
+            batch_name=getattr(args, "batch_name", None),
+        )
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_label_batch_commit(args) -> int:
+    from .lake_label import label_batch_commit
+    cfg = _lake_cfg(args)
+    coco_path = Path(args.coco_json) if args.coco_json else None
+    try:
+        label_batch_commit(
+            cfg,
+            batch_id=args.batch_id,
+            coco_json_path=coco_path,
+            dry_run=bool(args.dry_run),
+        )
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_label_batch_status(args) -> int:
+    from .lake_label import label_batch_status
+    cfg = _lake_cfg(args)
+    try:
+        label_batch_status(cfg, task=getattr(args, "task", None))
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_pull(args) -> int:
+    from .lake_pull import lake_pull
+    cfg = _lake_cfg(args)
+    sessions = [s.strip() for s in args.sessions.split(",") if s.strip()] if args.sessions else None
+    ds_root = Path(args.dataset_root) if args.dataset_root else None
+    try:
+        lake_pull(
+            cfg,
+            task=args.task,
+            sessions=sessions,
+            all_sessions=bool(args.all_sessions),
+            machine_id=getattr(args, "machine_id", None),
+            mold_id=getattr(args, "mold_id", None),
+            part_id=getattr(args, "part_id", None),
+            from_date=getattr(args, "from_date", None),
+            to_date=getattr(args, "to_date", None),
+            marker=getattr(args, "marker", None),
+            include_hard_negatives=bool(args.include_hard_negatives),
+            include_backgrounds=bool(args.include_backgrounds),
+            max_per_session=args.max_per_session,
+            min_per_session=int(args.min_per_session),
+            balance_classes=bool(args.balance_classes),
+            min_per_class=args.min_per_class,
+            train_ratio=float(args.train_ratio),
+            seed=int(args.seed),
+            dataset_uuid=getattr(args, "dataset_uuid", None),
+            dataset_name=getattr(args, "dataset_name", None),
+            dataset_root=ds_root,
+            dry_run=bool(args.dry_run),
+        )
+        return 0
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_index(args) -> int:
+    from .lake import index_rebuild, index_stats
+    cfg = _lake_cfg(args)
+    try:
+        if args.rebuild:
+            n = index_rebuild(cfg)
+            print(f"Index rebuilt: {n} records written to image_index.jsonl")
+        elif args.stats:
+            index_stats(cfg, task=getattr(args, "task", None))
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_models_install(args) -> int:
+    from .lake_models import models_install
+    cfg = _lake_cfg(args)
+    try:
+        models_install(cfg, bundle_path=Path(args.bundle), task=args.task)
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_models_list(args) -> int:
+    from .lake_models import models_list
+    cfg = _lake_cfg(args)
+    try:
+        models_list(cfg, task=getattr(args, "task", None))
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_models_promote(args) -> int:
+    from .lake_models import models_promote
+    cfg = _lake_cfg(args)
+    try:
+        models_promote(cfg, bundle_id=args.bundle_id, task=args.task, channel=args.channel)
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
+def _handle_lake_pools_add(args, *, pool: str) -> int:
+    """Add images to ``hard_negatives`` or ``backgrounds`` pool."""
+    from .lake import (
+        LABEL_STATUS_BACKGROUND,
+        LABEL_STATUS_HARD_NEGATIVE,
+        load_index,
+        patch_index_records,
+    )
+    cfg = _lake_cfg(args)
+    images: List[str] = list(args.images)
+    if not images:
+        print("Error: provide at least one --image path", file=sys.stderr)
+        return 2
+
+    reason = getattr(args, "reason", "")
+    manifest_path = cfg.storage().abs_path(f"pools/{pool}/manifest.jsonl")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    new_status = LABEL_STATUS_HARD_NEGATIVE if pool == "hard_negatives" else LABEL_STATUS_BACKGROUND
+    added = 0
+    # Load existing manifest to check for duplicates
+    existing: set = set()
+    if manifest_path.exists():
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    existing.add(json.loads(line).get("rel_path", ""))
+                except Exception:
+                    pass
+
+    with manifest_path.open("a", encoding="utf-8") as fh:
+        for img_rel in images:
+            # Normalise to POSIX relative path
+            img_rel = img_rel.replace("\\", "/")
+            if img_rel in existing:
+                print(f"  Skipped (already in pool): {img_rel}")
+                continue
+            entry: dict = {"rel_path": img_rel}
+            if reason:
+                entry["reason"] = reason
+            fh.write(json.dumps(entry) + "\n")
+            added += 1
+
+    # Update image_index.jsonl for known images
+    all_recs = load_index(cfg.root)
+    known_paths = {r["rel_path"] for r in all_recs}
+    to_patch = [img for img in images if img.replace("\\", "/") in known_paths]
+    if to_patch:
+        status_field = "detect_status"
+        patch_index_records(cfg.root, [p.replace("\\", "/") for p in to_patch], {status_field: new_status})
+
+    print(f"Added {added} image(s) to {pool} pool.")
+    return 0

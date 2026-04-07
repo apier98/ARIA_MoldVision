@@ -573,33 +573,36 @@ MoldPilot and MoldTrace consume it.
   → coupling stage → labeled dataset records
 ```
 
-### 6.2 Flow B — Model Training → Bundle Deployment to MoldPilot
+### 6.2 Flow B — Model Training → Bundle Deployment
+
+The detect model (5 classes: `Component_Base` + 4 defect classes) is the **same bundle**
+deployed to both MoldPilot and MoldTrace. Both consumers need `Component_Base` together
+with the defect classes — MoldPilot anchors severity metrics against it; MoldTrace uses it
+in the `components_from_clips` stage.
 
 ```
-[MoldVision]
-  moldvision dataset create + ingest + train + export + bundle --mpk
-  → produces mold-defect-v1.0.0.mpk
+[MoldVision — detect bundle]
+  moldvision dataset create + ingest + train --task detect + export + bundle --mpk
+  → produces mold-defect-v1.0.0.mpk  (5 classes: Component_Base + 4 defect classes)
 
-[Transfer]
+[Deploy to MoldPilot]
   Copy .mpk to MoldPilot machine (USB / S3 download / shared drive)
-
-[MoldPilot — model registry]
   LocalModelRegistryService.install_bundle("mold-defect-v1.0.0.mpk")
-  → validates manifest + checksums
   → extracts to models/bundles/mold-defect-v1.0.0/
-  → updates models/registry.json (active_bundle_id)
+  → OnnxInferenceService uses Component_Base for IoU tracking + defect classes for severity
 
-[MoldPilot — monitoring mode]
-  OnnxInferenceService.load_bundle("mold-defect-v1.0.0")
-  → reads preprocess.json, postprocess.json
-  → loads model_fp16.onnx (CUDA) or model.onnx (CPU)
-  → starts inference on live frames
+[Deploy to MoldTrace — components role]
+  python -m moldtrace models install mold-defect-v1.0.0.mpk --role components
+  python -m moldtrace models activate mold-defect-v1.0.0 --role components
+  → components_from_clips + defects_from_comps stages both use this same bundle
 ```
 
-### 6.3 Flow C — Model Training → Bundle Deployment to MoldTrace
+### 6.3 Flow C — Seg Model → Bundle Deployment to MoldTrace
+
+The seg model (1 class: `HMI_Screen`) is only needed by MoldTrace.
 
 ```
-[MoldVision]
+[MoldVision — seg bundle]
   moldvision train --task seg   ← for monitor_segmenter role
   moldvision bundle --mpk
 
@@ -609,7 +612,6 @@ MoldPilot and MoldTrace consume it.
 
 [MoldTrace — pipeline]
   extract_monitor_stage uses monitor_segmenter bundle
-  components_from_clips uses components bundle
 ```
 
 ### 6.4 Flow D — Labeled Dataset → Suggestion Logic (future)
