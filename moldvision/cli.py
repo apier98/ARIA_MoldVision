@@ -468,6 +468,15 @@ def build_parser() -> argparse.ArgumentParser:
     lk_lst.add_argument("--min-frames", type=int, default=0, help="Minimum total frames to include a session")
     lk_lst.add_argument("--lake-root", default=None)
 
+    lk_mbg = lk_sess_sub.add_parser(
+        "mark-bg",
+        help="Mark all unlabeled frames in a session as background (confirmed negatives)",
+    )
+    lk_mbg.add_argument("--session", required=True, help="Session ID to process")
+    lk_mbg.add_argument("--task", choices=["detect", "seg"], required=True)
+    lk_mbg.add_argument("--dry-run", action="store_true", help="Preview without modifying the index")
+    lk_mbg.add_argument("--lake-root", default=None)
+
     # lake label-batch
     lk_lb = lk_sub.add_parser("label-batch", help="Labeling batch commands (create, commit, status)")
     lk_lb_sub = lk_lb.add_subparsers(dest="lake_label_batch_cmd", required=True)
@@ -516,8 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     lk_pull.add_argument("--marker", default=None)
     lk_pull.add_argument("--include-hard-negatives", action="store_true")
     lk_pull.add_argument("--include-backgrounds", action="store_true")
+    lk_pull.add_argument("--total", type=int, default=None,
+                         help="Global cap on total images across all sessions (after per-session caps)")
     lk_pull.add_argument("--max-per-session", type=int, default=None)
     lk_pull.add_argument("--min-per-session", type=int, default=0)
+    lk_pull.add_argument(
+        "--priority-sessions", default=None,
+        help="Comma-separated session IDs that get full --max-per-session quota; others are capped at max/weight",
+    )
+    lk_pull.add_argument(
+        "--priority-weight", type=float, default=3.0,
+        help="Non-priority cap divisor (default 3 → they get max_per_session / 3)",
+    )
     lk_pull.add_argument("--balance-classes", action="store_true")
     lk_pull.add_argument("--min-per-class", type=int, default=None)
     lk_pull.add_argument("--train-ratio", type=float, default=0.8)

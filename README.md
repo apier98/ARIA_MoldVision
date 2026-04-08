@@ -223,18 +223,31 @@ moldvision lake init [--root PATH]
 
 # Register a MoldPilot qual session (called by MoldTrace after frame extraction)
 moldvision lake session import `
-  --session-meta path\to\session.json `
+  --session-meta   path\to\session.json `
+  --inspection-frames path\to\frames\
+
+# Also import monitor (HMI) frames from the same session
+moldvision lake session import `
+  --session-meta      path\to\session.json `
   --inspection-frames path\to\frames\ `
-  [--monitor-frames   path\to\hmi_frames\] `
-  [--overwrite]
+  --monitor-frames    path\to\hmi_frames\
 
 # Import external / pre-existing images (historical data, supplier datasets, etc.)
+# Without annotations — all images marked unlabeled:
 moldvision lake import `
-  --images-dir   path\to\images\ `
-  --task         detect|seg `
-  [--coco-json   path\to\annotations.coco.json]   # optional; partial annotation is fine
-  [--session-id  custom_id]
-  [--name "supplier batch A"] [--mold-id X] [--notes "..."]
+  --images-dir path\to\images\ `
+  --task       detect `
+  --session-id my_supplier_batch `
+  --name       "Supplier batch A" `
+  --mold-id    mold_xyz
+
+# With partial annotations (annotated images → labeled; rest → unlabeled):
+moldvision lake import `
+  --images-dir path\to\images\ `
+  --task       detect `
+  --coco-json  path\to\annotations.coco.json `
+  --session-id my_supplier_batch `
+  --mold-id    mold_xyz
 
 # ── Session browser ───────────────────────────────────────────────────────────
 
@@ -242,16 +255,28 @@ moldvision lake session list              # all sessions + coverage summary
 moldvision lake session list --mold-id X  # filter by mold
 moldvision lake session list --task seg   # only sessions with monitor frames
 
+# If some unlabeled frames in a session are confirmed negatives (no defects),
+# mark them as background so coverage shows 100% and they are excluded from
+# future label batches.
+moldvision lake session mark-bg --session collaudo_marco --task detect
+moldvision lake session mark-bg --session collaudo_marco --task detect --dry-run  # preview first
+
 # ── Annotation workflow ───────────────────────────────────────────────────────
 
-# Create a label batch (selects frames, copies them, prints Label Studio instructions)
+# Create a label batch — select 200 frames, temporal mode, min 5-frame gap between picks
 moldvision lake label-batch create `
-  --task    detect `
-  --n       200 `
-  --mode    temporal|random `
-  [--sessions id1 id2 ...] `
-  [--min-frame-gap 5] `
-  [--seed 42]
+  --task           detect `
+  --n              200 `
+  --mode           temporal `
+  --min-frame-gap  5 `
+  --seed           42
+
+# Restrict to specific sessions:
+moldvision lake label-batch create `
+  --task     detect `
+  --n        100 `
+  --mode     temporal `
+  --sessions trials_from_wittmann another_session_id
 
 # After annotating in Label Studio and exporting COCO JSON:
 moldvision lake label-batch commit `
@@ -267,14 +292,26 @@ moldvision lake label-batch status
 moldvision lake pull --task detect --dry-run
 
 # Pull a balanced training dataset
+# --max-per-session caps any single session; --balance-classes undersamples over-represented classes
 moldvision lake pull `
-  --task           detect `
-  --train-ratio    0.8 `
-  --max-per-session 300 `    # cap any single session at 300 images
-  --balance-classes `         # undersample over-represented classes
-  [--sessions id1 id2 ...] `  # restrict to specific sessions
-  [--include-pools]           # add hard-negative and background pools
-  [--out-dir datasets\]
+  --task            detect `
+  --train-ratio     0.8 `
+  --max-per-session 300 `
+  --balance-classes
+
+# Priority sessions: designated sessions get the full --max-per-session quota;
+# all other sessions are capped at max / priority-weight (default 3).
+# --total sets a hard global cap across all sessions (proportionally distributed,
+# priority sessions retain a larger share). Use --dry-run first to preview.
+moldvision lake pull `
+  --task              detect `
+  --all `
+  --total             300 `
+  --max-per-session   200 `
+  --priority-sessions "trials_from_wittmann,giotto_from_desk" `
+  --priority-weight   3 `
+  --balance-classes `
+  --dry-run
 
 # ── Index maintenance ─────────────────────────────────────────────────────────
 

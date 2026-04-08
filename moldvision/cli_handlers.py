@@ -1049,6 +1049,8 @@ def handle_lake(args) -> int:
             return _handle_lake_session_import(args)
         if sub == "list":
             return _handle_lake_session_list(args)
+        if sub == "mark-bg":
+            return _handle_lake_session_mark_bg(args)
 
     if lake_cmd == "label-batch":
         sub = getattr(args, "lake_label_batch_cmd", None)
@@ -1197,6 +1199,22 @@ def _handle_lake_session_list(args) -> int:
         return 2
 
 
+def _handle_lake_session_mark_bg(args) -> int:
+    from .lake_label import session_mark_backgrounds
+    cfg = _lake_cfg(args)
+    try:
+        session_mark_backgrounds(
+            cfg,
+            session_id=args.session,
+            task=args.task,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+
 def _handle_lake_label_batch_create(args) -> int:
     from .lake_label import label_batch_create
     cfg = _lake_cfg(args)
@@ -1257,6 +1275,11 @@ def _handle_lake_pull(args) -> int:
     from .lake_pull import lake_pull
     cfg = _lake_cfg(args)
     sessions = [s.strip() for s in args.sessions.split(",") if s.strip()] if args.sessions else None
+    priority_sessions = (
+        [s.strip() for s in args.priority_sessions.split(",") if s.strip()]
+        if getattr(args, "priority_sessions", None)
+        else None
+    )
     ds_root = Path(args.dataset_root) if args.dataset_root else None
     try:
         lake_pull(
@@ -1272,8 +1295,11 @@ def _handle_lake_pull(args) -> int:
             marker=getattr(args, "marker", None),
             include_hard_negatives=bool(args.include_hard_negatives),
             include_backgrounds=bool(args.include_backgrounds),
+            total=getattr(args, "total", None),
             max_per_session=args.max_per_session,
             min_per_session=int(args.min_per_session),
+            priority_sessions=priority_sessions,
+            priority_weight=float(getattr(args, "priority_weight", 3.0)),
             balance_classes=bool(args.balance_classes),
             min_per_class=args.min_per_class,
             train_ratio=float(args.train_ratio),

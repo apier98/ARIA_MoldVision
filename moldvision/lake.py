@@ -590,7 +590,12 @@ def index_stats(cfg: LakeConfig, task: Optional[str] = None) -> None:
     for r in records:
         by_session[r.get("session_id", "?")].append(r)
 
-    header = f"{'session_id':<44} {'machine':<10} {'mold':<12} {'raw':>6} {'detect':>8} {'seg':>6} {'coverage':>10}"
+    # Compute column widths dynamically based on session/machine/mold lengths
+    sid_w = max(12, min(64, max((len(sid) for sid in by_session), default=12)))
+    machine_w = max(8, min(20, max((len(by_session[sid][0].get('machine_id','') or '') for sid in by_session), default=8)))
+    mold_w = max(8, min(24, max((len(by_session[sid][0].get('mold_id','') or '') for sid in by_session), default=8)))
+
+    header = f"{'session_id':<{sid_w}} {'machine':<{machine_w}} {'mold':<{mold_w}} {'raw':>6} {'detect':>8} {'seg':>6} {'coverage':>10}"
     print(header)
     print("─" * len(header))
 
@@ -604,25 +609,34 @@ def index_stats(cfg: LakeConfig, task: Optional[str] = None) -> None:
         mon = [r for r in recs if r.get("frame_type") == "monitor"]
 
         detect_labeled = sum(1 for r in insp if r.get("detect_status") == LABEL_STATUS_LABELED)
+        detect_bg = sum(1 for r in insp if r.get("detect_status") == LABEL_STATUS_BACKGROUND)
         seg_labeled = sum(1 for r in mon if r.get("seg_status") == LABEL_STATUS_LABELED)
+        seg_bg = sum(1 for r in mon if r.get("seg_status") == LABEL_STATUS_BACKGROUND)
 
         raw_count = len(insp) if (task is None or task == "detect") else len(mon)
         labeled = detect_labeled if task == "detect" else seg_labeled if task == "seg" else detect_labeled + seg_labeled
         raw = len(insp) + len(mon) if task is None else raw_count
 
-        coverage_pct = f"{(detect_labeled / len(insp) * 100):.0f}%" if insp else "—"
+        # Coverage = (labeled + background) / total — backgrounds are intentionally reviewed negatives
+        detect_accounted = detect_labeled + detect_bg
+        seg_accounted = seg_labeled + seg_bg
+        coverage_pct = f"{(detect_accounted / len(insp) * 100):.0f}%" if insp else "—"
         if task == "seg":
-            coverage_pct = f"{(seg_labeled / len(mon) * 100):.0f}%" if mon else "—"
+            coverage_pct = f"{(seg_accounted / len(mon) * 100):.0f}%" if mon else "—"
 
         det_str = str(detect_labeled) if insp else "—"
+        if detect_bg:
+            det_str = f"{detect_labeled}+{detect_bg}bg"
         seg_str = str(seg_labeled) if mon else "—"
-        print(f"{sid:<44} {machine:<10} {mold:<12} {len(insp) + len(mon):>6} {det_str:>8} {seg_str:>6} {coverage_pct:>10}")
+        if seg_bg:
+            seg_str = f"{seg_labeled}+{seg_bg}bg"
+        print(f"{sid:<{sid_w}} {machine:<{machine_w}} {mold:<{mold_w}} {len(insp) + len(mon):>6} {det_str:>8} {seg_str:>6} {coverage_pct:>10}")
         total_raw += len(insp) + len(mon)
         total_detect += detect_labeled
         total_seg += seg_labeled
 
     print("─" * len(header))
-    print(f"{'TOTAL':<44} {'':<10} {'':<12} {total_raw:>6} {total_detect:>8} {total_seg:>6}")
+    print(f"{'TOTAL':<{sid_w}} {'':<{machine_w}} {'':<{mold_w}} {total_raw:>6} {total_detect:>8} {total_seg:>6}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -655,7 +669,12 @@ def session_list(
 
     matching: List[str] = []
 
-    header = f"{'session_id':<44} {'machine':<10} {'mold':<12} {'raw':>6} {'detect':>8} {'seg':>6} {'coverage':>10}"
+    # Compute column widths dynamically
+    sid_w = max(12, min(64, max((len(sid) for sid in by_session), default=12)))
+    machine_w = max(8, min(20, max((len(by_session[sid][0].get('machine_id','') or '') for sid in by_session), default=8)))
+    mold_w = max(8, min(24, max((len(by_session[sid][0].get('mold_id','') or '') for sid in by_session), default=8)))
+
+    header = f"{'session_id':<{sid_w}} {'machine':<{machine_w}} {'mold':<{mold_w}} {'raw':>6} {'detect':>8} {'seg':>6} {'coverage':>10}"
     print(header)
     print("─" * len(header))
 
@@ -681,7 +700,9 @@ def session_list(
         insp = [r for r in recs if r.get("frame_type") == "inspection"]
         mon = [r for r in recs if r.get("frame_type") == "monitor"]
         detect_labeled = sum(1 for r in insp if r.get("detect_status") == LABEL_STATUS_LABELED)
+        detect_bg = sum(1 for r in insp if r.get("detect_status") == LABEL_STATUS_BACKGROUND)
         seg_labeled = sum(1 for r in mon if r.get("seg_status") == LABEL_STATUS_LABELED)
+        seg_bg = sum(1 for r in mon if r.get("seg_status") == LABEL_STATUS_BACKGROUND)
 
         # task / label_status filter
         if task == "detect":
@@ -699,12 +720,19 @@ def session_list(
         if min_frames and total_raw < min_frames:
             continue
 
-        coverage_pct = f"{(detect_labeled / len(insp) * 100):.0f}%" if insp else "—"
+        # Coverage = (labeled + background) / total
+        detect_accounted = detect_labeled + detect_bg
+        seg_accounted = seg_labeled + seg_bg
+        coverage_pct = f"{(detect_accounted / len(insp) * 100):.0f}%" if insp else "—"
         if task == "seg":
-            coverage_pct = f"{(seg_labeled / len(mon) * 100):.0f}%" if mon else "—"
+            coverage_pct = f"{(seg_accounted / len(mon) * 100):.0f}%" if mon else "—"
         det_str = str(detect_labeled) if insp else "—"
+        if detect_bg:
+            det_str = f"{detect_labeled}+{detect_bg}bg"
         seg_str = str(seg_labeled) if mon else "—"
-        print(f"{sid:<44} {first.get('machine_id',''):<10} {first.get('mold_id',''):<12} "
+        if seg_bg:
+            seg_str = f"{seg_labeled}+{seg_bg}bg"
+        print(f"{sid:<{sid_w}} {first.get('machine_id',''):<{machine_w}} {first.get('mold_id',''):<{mold_w}} "
               f"{total_raw:>6} {det_str:>8} {seg_str:>6} {coverage_pct:>10}")
         matching.append(sid)
 

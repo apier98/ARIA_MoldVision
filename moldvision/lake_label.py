@@ -1,11 +1,16 @@
 """Label-batch workflow for the ARIA Data Lake.
 
-``label_batch_create``  — selects a subset of raw frames and copies them into
-                          ``label_batches/<batch_id>/images/`` for Label Studio.
+``label_batch_create``    — selects a subset of raw frames and copies them into
+                            ``label_batches/<batch_id>/images/`` for Label Studio.
 
-``label_batch_commit``  — reads the COCO export from Label Studio, merges
-                          annotations back into the session annotation files,
-                          and updates ``image_index.jsonl``.
+``label_batch_commit``    — reads the COCO export from Label Studio, merges
+                            annotations back into the session annotation files,
+                            and updates ``image_index.jsonl``.
+
+``session_mark_backgrounds`` — marks all currently-unlabeled frames in a session
+                            as ``background`` status in the index, so coverage
+                            statistics correctly reflect that these images were
+                            reviewed and confirmed to contain no objects of interest.
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .lake import (
     DETECT_CLASSES,
+    LABEL_STATUS_BACKGROUND,
     LABEL_STATUS_LABELED,
     LABEL_STATUS_UNLABELED,
     SEG_CLASSES,
@@ -505,3 +511,53 @@ def label_batch_status(cfg: LakeConfig, task: Optional[str] = None) -> None:
             continue
         n_frames = len(m.get("frames", []))
         print(f"{m.get('batch_id','?'):<45} {m.get('task','?'):<8} {m.get('status','?'):<12} {n_frames:>7} {m.get('created_at',''):<22}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# session_mark_backgrounds
+# ──────────────────────────────────────────────────────────────────────────────
+
+def session_mark_backgrounds(
+    cfg: LakeConfig,
+    *,
+    session_id: str,
+    task: str,
+    dry_run: bool = False,
+) -> int:
+    """Mark all currently-unlabeled frames in *session_id* as ``background``.
+
+    This is useful when you have inspected a session and confirmed that the
+    remaining unlabeled frames contain no objects of interest (pure negatives).
+    The index is updated so that coverage statistics correctly show 100% and
+    the images are excluded from future label-batch creation by default.
+
+    Returns the number of frames updated.
+    """
+    records = load_index(cfg.root)
+
+    unlabeled = filter_index(
+        records,
+        task=task,
+        session_ids=[session_id],
+        label_status=LABEL_STATUS_UNLABELED,
+    )
+
+    if not unlabeled:
+        print(f"No unlabeled {task} frames found in session '{session_id}'.")
+        return 0
+
+    rel_paths = [r["rel_path"] for r in unlabeled]
+
+    if dry_run:
+        print(f"[DRY RUN] Would mark {len(rel_paths)} frame(s) as background in session '{session_id}' (task={task}).")
+        for rp in rel_paths[:10]:
+            print(f"  {rp}")
+        if len(rel_paths) > 10:
+            print(f"  … and {len(rel_paths) - 10} more")
+        return len(rel_paths)
+
+    status_field = "detect_status" if task == "detect" else "seg_status"
+    patch_index_records(cfg.root, rel_paths, {status_field: LABEL_STATUS_BACKGROUND})
+
+    print(f"Marked {len(rel_paths)} frame(s) as background in session '{session_id}' (task={task}).")
+    return len(rel_paths)

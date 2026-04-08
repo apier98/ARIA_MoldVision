@@ -271,8 +271,11 @@ def lake_pull(
     marker: Optional[str] = None,
     include_hard_negatives: bool = False,
     include_backgrounds: bool = False,
+    total: Optional[int] = None,
     max_per_session: Optional[int] = None,
     min_per_session: int = 0,
+    priority_sessions: Optional[List[str]] = None,
+    priority_weight: float = 3.0,
     balance_classes: bool = False,
     min_per_class: Optional[int] = None,
     train_ratio: float = 0.8,
@@ -283,6 +286,13 @@ def lake_pull(
     dry_run: bool = False,
 ) -> Optional[str]:
     """Assemble a training dataset from labeled lake images.
+
+    Per-session caps (``max_per_session``) and a global cap (``total``) can
+    be combined.  Priority sessions receive a full ``max_per_session`` quota
+    while normal sessions are capped at ``max_per_session / priority_weight``.
+    If ``total`` is set and the sum across all sessions still exceeds it, the
+    budget is redistributed proportionally — priority sessions retain a larger
+    share (``priority_weight ×`` the per-unit allocation).
 
     Returns the dataset UUID, or None for dry-run.
     """
@@ -323,23 +333,68 @@ def lake_pull(
     if not by_session:
         raise RuntimeError(f"No sessions remain after applying --min-per-session {min_per_session}.")
 
-    # Apply max_per_session
+    # Apply max_per_session (with optional priority weighting)
     rng = random.Random(seed)
     session_provenance: List[Dict[str, Any]] = []
     selected_records: List[Dict[str, Any]] = []
 
+    priority_set = set(priority_sessions) if priority_sessions else set()
+
+    # Stage 1 — per-session caps
+    session_chosen: Dict[str, List[Dict[str, Any]]] = {}
     for sid in sorted(by_session.keys()):
         recs = by_session[sid]
         total_labeled = len(recs)
-        if max_per_session and len(recs) > max_per_session:
-            chosen = rng.sample(recs, max_per_session)
+
+        if max_per_session is None:
+            cap = None
+        elif sid in priority_set:
+            cap = max_per_session
+        else:
+            cap = max(1, int(max_per_session / max(1.0, priority_weight)))
+
+        if cap is not None and len(recs) > cap:
+            chosen = rng.sample(recs, cap)
         else:
             chosen = list(recs)
+
+        session_chosen[sid] = chosen
+
+    # Stage 2 — global total cap (proportional, respecting priority weight)
+    if total is not None:
+        current_total = sum(len(v) for v in session_chosen.values())
+        if current_total > total:
+            sids = sorted(session_chosen.keys())
+            weights = {sid: (priority_weight if sid in priority_set else 1.0) for sid in sids}
+            total_weight = sum(weights.values())
+
+            # Weighted proportional allocation — Largest Remainder Method
+            raw_alloc = {sid: total * weights[sid] / total_weight for sid in sids}
+            floors = {sid: int(v) for sid, v in raw_alloc.items()}
+            remainder = total - sum(floors.values())
+            by_frac = sorted(sids, key=lambda s: raw_alloc[s] - floors[s], reverse=True)
+            for i in range(remainder):
+                floors[by_frac[i]] += 1
+
+            # Re-sample each session down to its allocation (can't exceed what was chosen)
+            new_chosen: Dict[str, List[Dict[str, Any]]] = {}
+            for sid in sids:
+                alloc = min(floors[sid], len(session_chosen[sid]))
+                if alloc < len(session_chosen[sid]):
+                    new_chosen[sid] = rng.sample(session_chosen[sid], alloc)
+                else:
+                    new_chosen[sid] = session_chosen[sid]
+            session_chosen = new_chosen
+
+    for sid in sorted(session_chosen.keys()):
+        chosen = session_chosen[sid]
+        total_labeled = len(by_session[sid])
         selected_records.extend(chosen)
         session_provenance.append({
-            "session_id":          sid,
-            "frames_selected":     len(chosen),
+            "session_id":           sid,
+            "frames_selected":      len(chosen),
             "frames_total_labeled": total_labeled,
+            "priority":             sid in priority_set,
         })
 
     # Determine categories
@@ -401,12 +456,21 @@ def lake_pull(
 
     # Print dry-run report
     if dry_run:
+        total_selected = sum(sp["frames_selected"] for sp in session_provenance)
         print(f"\nlake pull DRY RUN — task={task}")
+        if priority_set:
+            print(f"Priority sessions: {', '.join(sorted(priority_set))}  (weight={priority_weight}x)")
+        if total is not None:
+            print(f"Global cap:        --total {total}  (selected: {total_selected})")
         print("─" * 66)
         print("Sessions (after filters):")
         for sp in session_provenance:
-            cap_note = f"→ capped at {max_per_session}" if max_per_session and sp["frames_selected"] < sp["frames_total_labeled"] else f"→ all {sp['frames_selected']} included"
-            print(f"  {sp['session_id']:<44}  {sp['frames_total_labeled']:>4} labeled  {cap_note}")
+            role = " [priority]" if sp["priority"] else ""
+            if sp["frames_selected"] < sp["frames_total_labeled"]:
+                cap_note = f"→ {sp['frames_selected']} selected"
+            else:
+                cap_note = f"→ all {sp['frames_selected']} included"
+            print(f"  {sp['session_id']:<44}{role:<11}  {sp['frames_total_labeled']:>4} labeled  {cap_note}")
         for sid in skipped_sessions:
             print(f"  {sid:<44}  skipped (< --min-per-session {min_per_session})")
 
@@ -515,10 +579,13 @@ def lake_pull(
             "marker":      marker,
         }.items() if v is not None},
         "distribution": {
-            "max_per_session": max_per_session,
-            "min_per_session": min_per_session,
-            "balance_classes": balance_classes,
-            "min_per_class":   min_per_class,
+            "total":            total,
+            "max_per_session":  max_per_session,
+            "min_per_session":  min_per_session,
+            "priority_sessions": list(priority_set) if priority_set else None,
+            "priority_weight":  priority_weight if priority_set else None,
+            "balance_classes":  balance_classes,
+            "min_per_class":    min_per_class,
         },
         "pools": {"hard_negatives": hn_count, "backgrounds": bg_count},
     }
