@@ -1573,3 +1573,44 @@ def _handle_predictive_validate_dataset(args) -> int:
                 print(f"  {lay.get('hmi_layout_id', '?')} / {lay.get('machine_family', '?')}")
 
     return 0 if report["valid"] else 3
+
+
+# ── publish ────────────────────────────────────────────────────────────────
+
+
+def handle_publish(args) -> int:
+    """Handle the 'publish' subcommand."""
+    from pathlib import Path
+    from moldvision.publish import publish_bundle
+
+    bundle_path = Path(args.bundle_path)
+    if not bundle_path.exists():
+        print(f"ERROR: Bundle path does not exist: {bundle_path}")
+        return 1
+
+    try:
+        result = publish_bundle(
+            bundle_path,
+            role=args.role,
+            channel=args.channel,
+            compatible_layouts=args.compatible_layouts,
+            dry_run=args.dry_run,
+        )
+    except ImportError as e:
+        print(f"ERROR: {e}")
+        return 1
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return 1
+    except Exception as e:
+        print(f"ERROR: Publishing failed: {e}")
+        return 1
+
+    if args.dry_run:
+        print("DRY RUN — catalog entry:")
+    else:
+        print("Published successfully:")
+
+    import json
+    print(json.dumps(result, indent=2))
+    return 0
