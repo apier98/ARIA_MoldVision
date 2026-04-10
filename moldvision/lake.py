@@ -38,6 +38,27 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 DETECT_CLASSES = ["Component_Base", "Weld_Line", "Sink_Mark", "Flash", "Burn_Mark"]
 SEG_CLASSES = ["HMI_Screen"]
 
+# Standardised model role names → lake directory names.
+MODEL_ROLES: Dict[str, str] = {
+    "defect_detector": "defect_detection",
+    "monitor_segmenter": "monitor_segmentation",
+}
+
+
+def resolve_role_directory(role: str) -> str:
+    """Return the lake-relative model directory for a given role name.
+
+    >>> resolve_role_directory("defect_detector")
+    'models/defect_detection'
+    """
+    try:
+        return f"models/{MODEL_ROLES[role]}"
+    except KeyError:
+        raise ValueError(
+            f"Unknown model role {role!r}. "
+            f"Valid roles: {', '.join(sorted(MODEL_ROLES))}"
+        )
+
 # Valid label-status values in image_index.jsonl
 LABEL_STATUS_UNLABELED = "unlabeled"
 LABEL_STATUS_LABELED = "labeled"

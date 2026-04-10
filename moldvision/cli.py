@@ -141,6 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include Python inference runner (infer.py, requirements.txt, vendored moldvision/) for use outside of ARIA MoldPilot.",
     )
+    bd.add_argument(
+        "--publish",
+        action="store_true",
+        help="Immediately publish the bundle to the S3 model catalog after creation.",
+    )
+    bd.add_argument("--publish-role", default=None, help="Model role for publish (e.g., defect_detector). Required with --publish.")
+    bd.add_argument("--publish-dry-run", action="store_true", help="Dry-run publish (print catalog entry without uploading)")
 
     # infer (bundle)
     inf = sub.add_parser("infer", help="Run inference using a deployment bundle directory (debug/smoke check)")

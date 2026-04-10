@@ -887,6 +887,30 @@ def handle_bundle(args) -> int:
         print(f"Error: {res.message}", file=sys.stderr)
         return 2
     print(res.message)
+
+    # E3: Publish-After-Train — if --publish, immediately publish the bundle.
+    if getattr(args, "publish", False):
+        role = getattr(args, "publish_role", None)
+        if not role:
+            print("Error: --publish-role is required when --publish is set", file=sys.stderr)
+            return 2
+        from moldvision.publish import publish_bundle
+        try:
+            pub_result = publish_bundle(
+                res.bundle_dir,
+                role=role,
+                channel=args.channel,
+                dry_run=getattr(args, "publish_dry_run", False),
+            )
+        except Exception as e:
+            print(f"Error: Publishing failed: {e}", file=sys.stderr)
+            return 2
+        import json as _json
+        if getattr(args, "publish_dry_run", False):
+            print("DRY RUN — catalog entry:")
+        else:
+            print("Published successfully:")
+        print(_json.dumps(pub_result, indent=2))
     return 0
 
 

@@ -191,6 +191,7 @@ def create_bundle(
     supersedes: Optional[str] = None,
     min_app_version: str = "0.0.0",
     standalone: bool = False,
+    compatible_layouts: Optional[List[str]] = None,
 ) -> BundleResult:
     dataset_dir = resolve_path(dataset_dir)
     weights = resolve_path(weights)
@@ -606,6 +607,7 @@ def create_bundle(
         },
         "runtime_versions": runtime_versions,
         "standalone": standalone,
+        "compatible_layouts": compatible_layouts if compatible_layouts is not None else ["*"],
     }
     save_json(bundle_dir / "manifest.json", manifest)
 
