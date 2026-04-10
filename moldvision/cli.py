@@ -593,6 +593,29 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Force index status update for this task. Auto-detected from path if omitted.")
     lk_pbg.add_argument("--lake-root", default=None)
 
+    # -------------------------------------------------------------------------
+    # predictive  (startup-suggestion model tooling)
+    # -------------------------------------------------------------------------
+    pred = sub.add_parser("predictive", help="Predictive model tooling (startup suggestion models)")
+    pred_sub = pred.add_subparsers(dest="predictive_cmd", required=True)
+
+    pred_val = pred_sub.add_parser(
+        "validate-dataset",
+        help="Validate a training_row_v1 JSONL file produced by MoldTrace",
+    )
+    pred_val.add_argument(
+        "--input", "-i", required=True,
+        help="Path to training_rows.jsonl (training_row_v1 format)",
+    )
+    pred_val.add_argument(
+        "--eligible-only", action="store_true",
+        help="Only report on rows where eligibility.training_ready is true",
+    )
+    pred_val.add_argument(
+        "--summary", action="store_true",
+        help="Print a dataset summary (feature counts, quality stats, defect distribution)",
+    )
+
     return p
 
 
@@ -629,6 +652,9 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.cmd == "lake":
         return cli_handlers.handle_lake(args)
+
+    if args.cmd == "predictive":
+        return cli_handlers.handle_predictive(args)
 
     build_parser().parse_args(["--help"])
     return 2

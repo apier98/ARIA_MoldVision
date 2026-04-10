@@ -1426,3 +1426,80 @@ def _handle_lake_pools_add(args, *, pool: str) -> int:
 
     print(f"Added {added} image(s) to {pool} pool.")
     return 0
+
+
+# ── predictive ──────────────────────────────────────────────────────────────
+
+def handle_predictive(args) -> int:
+    subcmd = getattr(args, "predictive_cmd", None)
+    if subcmd == "validate-dataset":
+        return _handle_predictive_validate_dataset(args)
+    print(f"Unknown predictive sub-command: {subcmd}")
+    return 2
+
+
+def _handle_predictive_validate_dataset(args) -> int:
+    from .predictive.training_row_loader import (
+        filter_eligible,
+        load_training_rows,
+        summarize_dataset,
+        validate_dataset,
+    )
+
+    input_path = resolve_path(args.input)
+    if not input_path.exists():
+        print(f"ERROR: File not found: {input_path}")
+        return 2
+
+    print(f"Loading {input_path} ...")
+    try:
+        rows = load_training_rows(input_path)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 2
+
+    if not rows:
+        print("WARNING: File contains zero rows.")
+        return 3
+
+    if args.eligible_only:
+        rows = filter_eligible(rows)
+        print(f"Filtered to {len(rows)} eligible (training_ready) rows.")
+        if not rows:
+            print("WARNING: No eligible rows after filtering.")
+            return 3
+
+    report = validate_dataset(rows)
+    print(f"\nValidation: {report['valid_rows']}/{report['total_rows']} rows valid.")
+    if report["row_errors"]:
+        print(f"\n{report['invalid_rows']} row(s) with errors:")
+        for entry in report["row_errors"][:20]:
+            sid = entry.get("session_id", "?")
+            cid = entry.get("component_id", "?")
+            for err in entry["errors"]:
+                print(f"  [{entry['index']}] session={sid} component={cid}: {err}")
+        if len(report["row_errors"]) > 20:
+            print(f"  ... and {len(report['row_errors']) - 20} more")
+
+    if args.summary:
+        summary = summarize_dataset(rows)
+        print(f"\n--- Dataset Summary ---")
+        print(f"Total rows:        {summary['total_rows']}")
+        print(f"Eligible rows:     {summary['eligible_rows']}")
+        print(f"Feature columns:   {summary['feature_columns']}")
+        print(f"Schema homogeneous:{summary['schema_homogeneous']}")
+        qs = summary.get("quality_score_stats") or {}
+        if qs.get("count"):
+            print(f"Quality score:     min={qs['min']}  max={qs['max']}  mean={qs['mean']}  n={qs['count']}")
+        dc = summary.get("defect_counts") or {}
+        if dc:
+            print("Defect counts:")
+            for label, cnt in dc.items():
+                print(f"  {label}: {cnt}")
+        layouts = summary.get("hmi_layouts_seen") or []
+        if layouts:
+            print(f"HMI layouts seen:  {len(layouts)}")
+            for lay in layouts:
+                print(f"  {lay.get('hmi_layout_id', '?')} / {lay.get('machine_family', '?')}")
+
+    return 0 if report["valid"] else 3
