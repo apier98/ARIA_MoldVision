@@ -80,6 +80,8 @@ def write_suggestion_bundle(
     min_app_version: str = "0.0.0",
     quality_weights: Optional[Dict[str, float]] = None,
     dataset_source: Optional[str] = None,
+    mold_id: Optional[str] = None,
+    material_id: Optional[str] = None,
 ) -> Path:
     """Write a startup-suggestion bundle directory.
 
@@ -104,6 +106,10 @@ def write_suggestion_bundle(
         Defaults to the canonical weights from §8.3.1.
     dataset_source:
         Optional path/UUID of the source dataset for traceability.
+    mold_id:
+        Mold identifier this bundle was trained for (scope axis 1).
+    material_id:
+        Material identifier this bundle was trained for (scope axis 2).
 
     Returns
     -------
@@ -172,6 +178,10 @@ def write_suggestion_bundle(
         "target_models":   target_models,
         "quality_weights": weights,
         "checksums":       checksums,
+        "scope": {
+            "mold_id":     mold_id,
+            "material_id": material_id,
+        },
     }
     _save_json(bundle_dir / "manifest.json", manifest)
 

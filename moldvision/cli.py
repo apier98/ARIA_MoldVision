@@ -652,6 +652,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--null-strategy", choices=["mean_impute", "zero_impute"], default="mean_impute",
         help="Strategy for imputing missing feature values (default: mean_impute)",
     )
+    pred_train.add_argument(
+        "--mold-id", default=None,
+        help="Mold ID to scope this training run. Only rows with matching mold_id are used.",
+    )
+    pred_train.add_argument(
+        "--material-id", default=None,
+        help="Material ID to scope this training run. Only rows with matching material_id are used.",
+    )
 
     pred_bundle = pred_sub.add_parser(
         "bundle",
@@ -680,6 +688,14 @@ def build_parser() -> argparse.ArgumentParser:
     pred_bundle.add_argument(
         "--sugbundle", action="store_true",
         help="Also pack the bundle directory into a .sugbundle zip archive",
+    )
+    pred_bundle.add_argument(
+        "--mold-id", default=None,
+        help="Mold ID to encode in the bundle scope block (optional, recommended)",
+    )
+    pred_bundle.add_argument(
+        "--material-id", default=None,
+        help="Material ID to encode in the bundle scope block (optional, recommended)",
     )
 
     # ---- publish ----

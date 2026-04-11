@@ -142,6 +142,10 @@ def validate_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
         "invalid_rows": len(row_errors),
         "valid": len(row_errors) == 0,
         "row_errors": row_errors,
+        "scope_warnings": {
+            "null_mold_id": sum(1 for r in rows if not r.get("mold_id")),
+            "null_material_id": sum(1 for r in rows if not r.get("material_id")),
+        },
     }
 
 
@@ -280,6 +284,13 @@ def summarize_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
                 label = key[len("y_defect_"):]
                 defect_counts[label] = defect_counts.get(label, 0) + 1
 
+    # Scope coverage: count rows with null mold_id / material_id
+    null_mold_id = sum(1 for r in rows if not r.get("mold_id"))
+    null_material_id = sum(1 for r in rows if not r.get("material_id"))
+    scopes: set[tuple] = {
+        (r.get("mold_id") or None, r.get("material_id") or None) for r in rows
+    }
+
     return {
         "total_rows": len(rows),
         "eligible_rows": len(eligible),
@@ -294,6 +305,11 @@ def summarize_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
             "mean": round(sum(quality_scores) / len(quality_scores), 4) if quality_scores else None,
         },
         "defect_counts": dict(sorted(defect_counts.items())),
+        "scope_coverage": {
+            "null_mold_id": null_mold_id,
+            "null_material_id": null_material_id,
+            "distinct_scopes": len(scopes),
+        },
     }
 
 

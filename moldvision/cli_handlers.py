@@ -1579,6 +1579,12 @@ def _handle_predictive_validate_dataset(args) -> int:
         if len(report["row_errors"]) > 20:
             print(f"  ... and {len(report['row_errors']) - 20} more")
 
+    sw = report.get("scope_warnings", {})
+    if sw.get("null_mold_id", 0) > 0:
+        print(f"SCOPE WARNING: {sw['null_mold_id']} row(s) missing mold_id — scope-specific training will not work correctly.")
+    if sw.get("null_material_id", 0) > 0:
+        print(f"SCOPE WARNING: {sw['null_material_id']} row(s) missing material_id — pass --material-id when training to ensure correct scoping.")
+
     if args.summary:
         summary = summarize_dataset(rows)
         print(f"\n--- Dataset Summary ---")
@@ -1599,6 +1605,13 @@ def _handle_predictive_validate_dataset(args) -> int:
             print(f"HMI layouts seen:  {len(layouts)}")
             for lay in layouts:
                 print(f"  {lay.get('hmi_layout_id', '?')} / {lay.get('machine_family', '?')}")
+        sc = summary.get("scope_coverage") or {}
+        if sc:
+            print(f"Scope coverage:    {sc.get('distinct_scopes', 0)} distinct scope(s)")
+            if sc.get("null_mold_id", 0):
+                print(f"  ⚠  {sc['null_mold_id']} row(s) missing mold_id")
+            if sc.get("null_material_id", 0):
+                print(f"  ⚠  {sc['null_material_id']} row(s) missing material_id")
 
     return 0 if report["valid"] else 3
 
@@ -1617,6 +1630,8 @@ def _handle_predictive_train(args) -> int:
 
     input_path = resolve_path(args.input)
     output_dir = resolve_path(args.output_dir)
+    scope_mold_id: str | None = getattr(args, "mold_id", None)
+    scope_material_id: str | None = getattr(args, "material_id", None)
 
     if not input_path.exists():
         print(f"ERROR: File not found: {input_path}")
@@ -1632,6 +1647,25 @@ def _handle_predictive_train(args) -> int:
     if not rows:
         print("ERROR: File contains zero rows.")
         return 2
+
+    # Scope filtering — keep only rows that match declared mold_id / material_id.
+    if scope_mold_id or scope_material_id:
+        original_count = len(rows)
+        if scope_mold_id:
+            rows = [r for r in rows if r.get("mold_id") == scope_mold_id]
+        if scope_material_id:
+            rows = [r for r in rows if r.get("material_id") == scope_material_id]
+        dropped = original_count - len(rows)
+        if dropped:
+            print(f"Scope filter: dropped {dropped} rows not matching mold_id={scope_mold_id!r} / material_id={scope_material_id!r}")
+        if not rows:
+            print("ERROR: No rows remain after scope filtering. Check --mold-id / --material-id values.")
+            return 2
+
+    # Warn if material_id is absent across all rows (data collection gap).
+    null_material = sum(1 for r in rows if not r.get("material_id"))
+    if null_material:
+        print(f"WARNING: {null_material}/{len(rows)} rows have no material_id — consider passing --material-id to scope training correctly.")
 
     cfg = GbtTrainingConfig(
         n_estimators=args.n_estimators,
@@ -1666,8 +1700,18 @@ def _handle_predictive_train(args) -> int:
     with open(pkl_path, "wb") as fh:
         pickle.dump(result, fh)
 
+    # Write a scope.json alongside so predictive bundle can pick it up automatically.
+    import json
+    scope_path = output_dir / "scope.json"
+    scope_path.write_text(
+        json.dumps({"mold_id": scope_mold_id, "material_id": scope_material_id}, indent=2),
+        encoding="utf-8",
+    )
+
     print(f"\nArtifacts written to: {output_dir}")
     print(f"  {pkl_path.name}")
+    if scope_mold_id or scope_material_id:
+        print(f"  scope.json  (mold_id={scope_mold_id!r}, material_id={scope_material_id!r})")
     return 0
 
 
@@ -1678,6 +1722,7 @@ def _handle_predictive_bundle(args) -> int:
     all targets to ONNX, writes a ``manifest.json`` + ``training_meta.json``,
     and optionally packs the directory into a ``.sugbundle`` zip archive.
     """
+    import json
     import pickle
 
     from .predictive.suggestion_bundle import pack_sugbundle, write_suggestion_bundle
@@ -1689,6 +1734,22 @@ def _handle_predictive_bundle(args) -> int:
         print(f"ERROR: train_result.pkl not found in {train_dir}")
         print("       Run 'predictive train' first.")
         return 2
+
+    # Load scope from scope.json written by 'predictive train', overridden by explicit flags.
+    scope_mold_id: str | None = getattr(args, "mold_id", None)
+    scope_material_id: str | None = getattr(args, "material_id", None)
+    scope_path = train_dir / "scope.json"
+    if scope_path.exists():
+        saved_scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        if scope_mold_id is None:
+            scope_mold_id = saved_scope.get("mold_id")
+        if scope_material_id is None:
+            scope_material_id = saved_scope.get("material_id")
+
+    if not scope_mold_id or not scope_material_id:
+        print("WARNING: Bundle scope is incomplete — mold_id or material_id is not set.")
+        print("         The bundle will load with unscoped fallback in MoldPilot.")
+        print("         Provide --mold-id and --material-id for production bundles.")
 
     print(f"Loading training result from {pkl_path} ...")
     with open(pkl_path, "rb") as fh:
@@ -1704,12 +1765,16 @@ def _handle_predictive_bundle(args) -> int:
             model_version=args.model_version,
             channel=args.channel,
             supersedes=args.supersedes,
+            mold_id=scope_mold_id,
+            material_id=scope_material_id,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"ERROR: Bundle write failed — {exc}")
         return 2
 
     print(f"  Bundle directory: {bundle_dir}")
+    if scope_mold_id or scope_material_id:
+        print(f"  Scope: mold_id={scope_mold_id!r}  material_id={scope_material_id!r}")
 
     if args.sugbundle:
         archive = pack_sugbundle(bundle_dir)

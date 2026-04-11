@@ -160,6 +160,7 @@ all hardware interfaces (`ARIA_MOTION_MOCK=1`, etc.), enabling full off-machine 
   "machine_id":            "machine_01",
   "mold_id":               "mold_a12",
   "part_id":               "part_cap_32",
+  "material_id":           "pp_natureworks_4032d",
   "started_at":            "2026-03-24T09:30:00+00:00",
   "ended_at":              "2026-03-24T09:45:12+00:00",
   "status":                "completed",
@@ -170,6 +171,12 @@ all hardware interfaces (`ARIA_MOTION_MOCK=1`, etc.), enabling full off-machine 
   "video_chunks":          ["component_view_chunk_001.mp4", "component_view_chunk_002.mp4"]
 }
 ```
+
+> **`material_id`** is not yet collected by MoldPilot (see §8.9). It is set to `null` until that
+> gap is closed. All downstream consumers (MoldTrace, MoldVision) must treat `null` as "unknown
+> material" and must NOT silently merge rows with `null` material into a mixed-material model —
+> they should be stored in a separate bucket until the value is known. See §8.8 for the model
+> scope policy.
 
 ### 3.6 Model Bundle Contract (consumed by MoldPilot)
 
@@ -839,7 +846,10 @@ needed to close the end-to-end loop.
 The canonical rule for startup-suggestion training is:
 
 1. One supervised row per coupled `component_id`.
-2. Input features come only from coupled process-state slots, not from defects, future observations, or operator metadata.
+2. **Training scope is `(mold_id, material_id)` — never global.** Rows from different molds or
+   different materials must NOT be mixed into the same model. See §8.8 for the full model scope
+   policy and industrial rationale.
+3. Input features come only from coupled process-state slots, not from defects, future observations, or operator metadata.
 3. For each process slot, export flat scalar features using the **unscoped** `parameter_id_base` as the key root (never the page-scoped form `page|subpage|param_id`):
    `last`, `mean`, `median`, `min`, `max`, `q05`, `q95`, `coverage_ratio`, `n_points_accepted`, `n_points_total`.
 4. Targets are derived per defect class plus a global scalar quality score:
@@ -951,9 +961,160 @@ single source of truth for the interchange format between MoldTrace (producer) a
 - MoldVision `predictive validate-dataset` checks rows against this schema's invariants.
 - CI pipelines can use `jsonschema` to validate MoldTrace output directly.
 
+### 8.8 Model Scope Policy — Mold / Machine / Material
+
+**Status**: Gap — the current GBT training trains one global model over all accumulated rows,
+regardless of `mold_id`, `material_id`, or `machine_id`. This is incorrect for production use.
+
+#### Industrial context
+
+In injection moulding, the **mold** is the primary determinant of the process-quality relationship:
+cavity geometry, gate location, cooling channel layout, and wall thickness distribution all dictate
+which parameter combinations produce acceptable parts. Commercial systems (Engel iQ weight control,
+KraussMaffei APC+, Sumitomo SHI Demag AI-MCC) scope their models per mold.
+
+The **material** is the second axis: rheological properties (melt flow index, thermal conductivity)
+shift the optimal temperature/pressure window — sometimes by 15–30 °C barrel temperature. Mixing
+rows from different materials makes the model learn contradictory correlations.
+
+The **machine** is the weakest axis: twin machines of the same model share ≈ 85–95 % of their
+process-quality response. The residual (hydraulic response, heater offsets, clamp variation) is
+exactly what the Tier 2 online GP adaptation is designed to correct at runtime — no per-machine
+model is needed.
+
+#### Decision: one model per `(mold_id, material_id)`
+
+| Scope axis | Handled by |
+|------------|-----------|
+| `mold_id` | Separate GBT model per mold (trained and bundled independently in MoldVision) |
+| `material_id` | Separate GBT model per material within a mold (if data allows; otherwise single-material models) |
+| `machine_id` | **Not** a training scope boundary — handled by Tier 2 GP online adaptation at runtime |
+
+A bundle filename convention that encodes scope:
+```
+<mold_id>-<material_id>-startup-suggestion-v<version>.sugbundle
+e.g.  mold-a12-pp-natureworks-startup-suggestion-v1.0.0.sugbundle
+```
+
+The bundle `manifest.json` carries the scope:
+```json
+{
+  "bundle_type":  "startup_suggestion",
+  "scope": {
+    "mold_id":      "mold_a12",
+    "material_id":  "pp_natureworks_4032d",
+    "machine_id":   null
+  }
+}
+```
+
+MoldPilot's `TieredStartupAssistantService` must select the bundle whose `scope.mold_id` and
+`scope.material_id` match the current session context (from the active configuration + session
+form overrides — see §8.9). If no exact match exists, the fallback order is:
+1. Same `mold_id`, any material → emit a warning in the UI.
+2. No bundle for this mold → Tier 0 (rule-based) only.
+
+#### What needs to change
+
+**MoldTrace**:
+- Pass `mold_id` and `material_id` as filters to `export_training_rows`. Output one JSONL file per
+  `(mold_id, material_id)` combination. Add `scope` block to the training row JSONL header.
+- Validate that all rows in a JSONL have the same `mold_id` and `material_id` before export.
+
+**MoldVision** (`predictive train` + `predictive bundle`):
+- Add `--mold-id` and `--material-id` flags to `predictive train`. These are passed into the
+  bundle manifest as `scope` fields.
+- Before training, assert that all eligible rows share the declared `mold_id` / `material_id`
+  (fail-fast with a clear error if they don't).
+- The `predictive bundle` command encodes scope into the bundle filename and manifest.
+
+**MoldPilot**:
+- Bundle selection logic: `SuggestionBundleReader` must match on `scope` fields when choosing
+  which installed bundle to activate. Currently it loads the single installed bundle blindly.
+- The Startup Assistant workspace must show the active scope (mold + material) in the UI so the
+  operator can confirm the right model is loaded.
+
+#### Minimum data per scope
+
+A (mold_id, material_id) scope needs ≥ 300 eligible rows to train a reliable GBT prior. With
+fewer rows:
+- 10–50 rows: model will overfit — deploy Tier 0 only.
+- 50–150 rows: train but expect AUC/RMSE near the degraded-model thresholds; worth deploying
+  as a rough prior if Tier 0 is the only alternative.
+- 150–300 rows: good prior; Tier 2 GP will refine at runtime.
+- 300+ rows: reliable prior; Tier 2 correction is incremental.
+
 ---
 
-## 9. Development & Tooling Notes
+### 8.9 Qualification Form — Missing Material + Session-Override Fields
+
+**Status**: Gap — MoldPilot's qualification form only collects `operator_name` and `batch_number`
+from the operator. All other identity fields (`machine_id`, `mold_id`, `part_id`) come silently
+from the loaded `PublishedConfigurationRef`. `material_id` is not collected anywhere.
+
+#### Problem
+
+1. **Material is not captured at all.** The configuration domain model
+   (`PublishedConfigurationRef`) has no `material_id` field. Training rows carry `null` for
+   material, making model scoping (§8.8) impossible.
+
+2. **No operator-level override at session time.** An operator loading a configuration
+   implicitly locks in the `machine_id`/`mold_id`/`part_id` that the engineer entered. If the
+   operator is running on a different machine (e.g., production shifted from machine A to B), or
+   trialling a different material grade, there is no way to record this without the engineer
+   updating the configuration — a heavyweight workflow.
+
+3. **Loss of scientific validity.** A session recorded with wrong `machine_id` contaminates the
+   training dataset for the wrong machine scope. Because §8.3.1 rules 2 and 7 rely on traceability
+   fields for auditability, incorrect values silently degrade model quality.
+
+#### Proposed qualification form redesign
+
+Show the identity block pre-populated from the loaded configuration, editable by the operator
+before pressing Start. Fields in **bold** are new:
+
+| Field | Source | Editable at session start | Required |
+|-------|--------|--------------------------|---------|
+| Operator name | form input | ✅ yes | ✅ yes |
+| Batch / Lot number | form input | ✅ yes | ✅ yes |
+| **Machine ID** | config default | ✅ yes, overrides config | ✅ yes |
+| **Mold ID** | config default | ✅ yes, overrides config | ✅ yes |
+| **Material ID** | form input | ✅ yes | ✅ yes |
+| Part ID | config default | optional override | no |
+| Notes | form input | ✅ yes | no |
+
+Override values are written to the session manifest and to every `traceability` block in the
+downstream training rows. They do NOT mutate the configuration record — the configuration is
+just a template.
+
+#### What needs to change
+
+**MoldPilot — domain layer**:
+- Add `material_id: str | None` to `PublishedConfigurationRef` (can be `null` for existing
+  configurations — triggers a "please add material" warning in Engineer Mode).
+- Add `machine_id`, `mold_id`, `material_id` override fields to `OperatorSessionMetadata`.
+- Logic: `effective_machine_id = metadata.machine_id_override or config.machine_id`.
+
+**MoldPilot — UI (`qualification_workspace.py`)**:
+- Add Machine ID, Mold ID, Material ID fields to the operator form, pre-populated from config.
+- Machine ID and Mold ID show the config values greyed-out as placeholder text — operator
+  confirms or overrides.
+- Material ID is a free-text field with no default (forces operator input).
+- "Start Qualification" button requires all three to be non-empty.
+
+**MoldPilot — qualification session manifest writer**:
+- Write `material_id` to the session manifest.
+- Write override-resolved `machine_id` and `mold_id` (effective values, not config template).
+
+**MoldTrace**:
+- Read `material_id` from session manifest → propagate to all training row `traceability` blocks.
+- The session creation tool (`create_session.py`) gains `--material-id` flag for manual runs.
+
+**MoldVision**:
+- `predictive validate-dataset` warns when rows have `null` material_id.
+- `predictive train --mold-id X --material-id Y` validates that all rows match before training.
+
+---
 
 ### 9.1 Running Without Hardware (MoldPilot)
 
@@ -1022,6 +1183,8 @@ moldvision bundle -d <UUID> -w checkpoint_best_total.pth `
 
 | Term | Definition |
 |------|-----------|
+| **material_id** | Identifier for the plastic material + grade used in a production session (e.g. `pp_natureworks_4032d`). A first-class scope axis for suggestion model training alongside `mold_id` |
+| **Model Scope** | The `(mold_id, material_id)` combination that defines the training and inference boundary for a suggestion bundle. Rows from different scopes must never be mixed |
 | **Qualification Mode** | MoldPilot operating mode that records session videos during mold setup/tuning |
 | **Monitoring Mode** | MoldPilot operating mode that runs live ONNX inference and tracks defect severity |
 | **Startup Assistant** | MoldPilot screen showing ML-suggested process parameters for junior operators |
