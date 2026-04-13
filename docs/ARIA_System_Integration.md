@@ -715,7 +715,8 @@ MoldPilot and MoldTrace consume it.
 
 [MoldPilot — Startup Assistant, Tier 1: offline prior]
   StartupAssistantService.get_suggestion(current_params)
-  → loads bundle, builds feature vector from current HMI state
+  → loads bundle, builds feature vector from the current startup working state
+    (v1: assumed operator-applied parameter vector; future: live HMI readback)
   → runs GBT inference → quality_score + defect_risks
   → local search over candidate adjustments → ranked MachineParameter suggestions
   → displayed as threshold bars + recommended parameter adjustments
@@ -723,7 +724,8 @@ MoldPilot and MoldTrace consume it.
 [MoldPilot — Startup Assistant, Tier 2: online Bayesian adaptation]
   After each shot during startup (CV model is live in Monitoring Mode):
   → compute q_shot = 1 − clamp(Σ weight_i × burden_i, 0, 1)  [live defect observations]
-  → observe θ_shot from current HMI parameter state
+  → observe θ_shot from the startup working parameter state
+    (v1: assumed operator-applied vector; future: live HMI readback)
   → update GP surrogate posterior on (θ_shot, q_shot)
   → next suggestion via EI acquisition on the GP
   → naturally corrects for twin-machine domain shift (machine Y ≠ machine X used in qualification)
@@ -739,8 +741,10 @@ MoldPilot and MoldTrace consume it.
 > machine Y (a mechanical twin). The offline GBT prior encodes knowledge from machine X. The
 > online GP adaptation layer in MoldPilot corrects for machine Y's systematic residual
 > (pressure/temperature offsets, hydraulic response) using live defect observations from the
-> first few startup shots. No additional data pipeline is needed — the monitoring loop already
-> produces the required `(params, defects)` observations.
+> first few startup shots. In the first customer release, startup mode has no live HMI feed:
+> MoldPilot uses the assistant's working parameter vector (baselines plus operator-confirmed
+> applied suggestions) as `θ_shot`. The monitoring loop provides defects; the parameter side is
+> this assumed working state until direct startup HMI telemetry is added.
 
 > **Online adaptation boundary**: The Tier 2 GP adaptation is an algorithm in MoldPilot, not a
 > trained artefact. It has no bundle format and is not produced or versioned by MoldVision.
@@ -904,7 +908,7 @@ This rule is designed to support:
 - Wire the bundle into `StartupAssistantService` in MoldPilot — Tier 1 (overrides Tier 0).
 - Implement `StartupAdaptationService` in MoldPilot — Tier 2 (online GP adaptation):
   - GP surrogate initialised from Tier 1 predictions.
-  - Updated after each startup shot with live `(θ_shot, q_shot)` observations.
+  - Updated after each startup shot with session-scoped `(θ_shot, q_shot)` observations.
   - EI acquisition proposes the next parameter vector.
   - Resets at new mould startup session start.
   - Falls back to Tier 1 (then Tier 0) when fewer than 3 observations are available.

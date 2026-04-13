@@ -7,12 +7,14 @@ import unittest
 from pathlib import Path
 
 from moldvision.predictive.training_row_loader import (
+    assess_training_readiness,
     check_schema_homogeneity,
     extract_feature_matrix,
     extract_targets,
     filter_eligible,
     infer_feature_keys,
     load_training_rows,
+    summarize_scope_distribution,
     summarize_dataset,
     validate_dataset,
     validate_row,
@@ -191,6 +193,14 @@ class TestValidateDataset(unittest.TestCase):
         self.assertFalse(report["valid"])
         self.assertEqual(report["invalid_rows"], 1)
 
+    def test_scope_warnings_capture_missing_scope_fields(self) -> None:
+        row = _make_row()
+        row["mold_id"] = None
+        row["material_id"] = None
+        report = validate_dataset([row])
+        self.assertEqual(report["scope_warnings"]["null_mold_id"], 1)
+        self.assertEqual(report["scope_warnings"]["null_material_id"], 1)
+
 
 class TestFilterEligible(unittest.TestCase):
     def test_filters_ineligible(self) -> None:
@@ -270,6 +280,32 @@ class TestSchemaHomogeneity(unittest.TestCase):
         self.assertEqual(result["n_schemas"], 2)
 
 
+class TestScopeDistribution(unittest.TestCase):
+    def test_scope_distribution_lists_distinct_scopes_and_families(self) -> None:
+        row1 = _make_row(machine_family="FAMILY_A")
+        row1["mold_id"] = "mold_a12"
+        row1["material_id"] = "pp"
+        row2 = _make_row(session_id="sess_002", machine_family="FAMILY_B")
+        row2["mold_id"] = "mold_a12"
+        row2["material_id"] = "abs"
+
+        result = summarize_scope_distribution([row1, row2])
+
+        self.assertEqual(result["distinct_scope_count"], 2)
+        self.assertEqual(result["machine_family_count"], 2)
+        self.assertIn(("mold_a12", "pp"), result["distinct_scopes"])
+        self.assertIn("FAMILY_A", result["machine_families"])
+
+
+class TestTrainingReadiness(unittest.TestCase):
+    def test_readiness_thresholds(self) -> None:
+        self.assertEqual(assess_training_readiness(5)["level"], "blocked")
+        self.assertEqual(assess_training_readiness(25)["level"], "poor")
+        self.assertEqual(assess_training_readiness(75)["level"], "weak")
+        self.assertEqual(assess_training_readiness(200)["level"], "good")
+        self.assertEqual(assess_training_readiness(400)["level"], "strong")
+
+
 class TestSummarizeDataset(unittest.TestCase):
     def test_summary_structure(self) -> None:
         rows = [_make_row(), _make_row(session_id="sess_002", training_ready=False)]
@@ -280,6 +316,7 @@ class TestSummarizeDataset(unittest.TestCase):
         self.assertIn("quality_score_stats", summary)
         self.assertIn("defect_counts", summary)
         self.assertIn("sink_mark", summary["defect_counts"])
+        self.assertIn("training_readiness", summary)
 
 
 if __name__ == "__main__":

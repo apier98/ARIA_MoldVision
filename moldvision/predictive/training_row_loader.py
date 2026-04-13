@@ -145,7 +145,68 @@ def validate_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
         "scope_warnings": {
             "null_mold_id": sum(1 for r in rows if not r.get("mold_id")),
             "null_material_id": sum(1 for r in rows if not r.get("material_id")),
+            "mixed_machine_families": len({
+                (r.get("context") or {}).get("machine_family") for r in rows
+                if (r.get("context") or {}).get("machine_family")
+            }) > 1,
         },
+    }
+
+
+def summarize_scope_distribution(rows: Sequence[dict]) -> Dict[str, Any]:
+    """Summarize scope coverage across a dataset.
+
+    Returns distinct mold/material scopes and machine families seen, excluding
+    fully-null scopes from the distinct scoped set.
+    """
+    scoped_rows = [
+        (
+            r.get("mold_id") or None,
+            r.get("material_id") or None,
+        )
+        for r in rows
+    ]
+    distinct_scopes = sorted({scope for scope in scoped_rows if scope != (None, None)})
+    machine_families = sorted(
+        {
+            (r.get("context") or {}).get("machine_family")
+            for r in rows
+            if (r.get("context") or {}).get("machine_family")
+        }
+    )
+    return {
+        "distinct_scopes": distinct_scopes,
+        "distinct_scope_count": len(distinct_scopes),
+        "machine_families": machine_families,
+        "machine_family_count": len(machine_families),
+    }
+
+
+def assess_training_readiness(n_eligible_rows: int) -> Dict[str, str]:
+    """Return a coarse readiness verdict for startup-suggestion training."""
+    if n_eligible_rows < 10:
+        return {
+            "level": "blocked",
+            "message": "Too few eligible rows to train any reliable model.",
+        }
+    if n_eligible_rows < 50:
+        return {
+            "level": "poor",
+            "message": "Model is likely to overfit; prefer Tier 0 only.",
+        }
+    if n_eligible_rows < 150:
+        return {
+            "level": "weak",
+            "message": "Trainable, but expect degraded accuracy.",
+        }
+    if n_eligible_rows < 300:
+        return {
+            "level": "good",
+            "message": "Reasonable offline prior; Tier 2 should refine it at runtime.",
+        }
+    return {
+        "level": "strong",
+        "message": "Sufficient data for a reliable offline prior.",
     }
 
 
@@ -272,6 +333,8 @@ def summarize_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
     eligible = filter_eligible(rows)
     homogeneity = check_schema_homogeneity(rows)
     feature_keys = infer_feature_keys(rows)
+    scope_distribution = summarize_scope_distribution(rows)
+    readiness = assess_training_readiness(len(eligible))
     quality_scores = [
         t for t in extract_targets(eligible, "y_quality_score")
         if t is not None
@@ -309,7 +372,10 @@ def summarize_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
             "null_mold_id": null_mold_id,
             "null_material_id": null_material_id,
             "distinct_scopes": len(scopes),
+            "scopes": scope_distribution["distinct_scopes"],
+            "machine_families": scope_distribution["machine_families"],
         },
+        "training_readiness": readiness,
     }
 
 

@@ -111,9 +111,9 @@ moldvision predictive validate-dataset --input C:\data\mold_a_training_rows.json
 
 This reports:
 - Row count and schema conformance
-- Fraction of rows with each defect flag
-- Missing-value rates per feature column
-- Class imbalance warnings
+- Scope coverage and machine-family spread
+- Schema homogeneity across HMI layouts
+- A coarse training-readiness verdict
 
 ### 3. Train the models
 
@@ -121,8 +121,8 @@ This reports:
 moldvision predictive train `
   --input C:\data\mold_a_training_rows.jsonl `
   --output-dir runs\mold-a-v1 `
-  --model-name "Mold A Startup Suggestion" `
-  --model-version 1.0.0
+  --mold-id mold_a12 `
+  --material-id pp_natureworks_4032d
 ```
 
 Outputs written to `runs\mold-a-v1\`:
@@ -130,12 +130,7 @@ Outputs written to `runs\mold-a-v1\`:
 | File | Contents |
 |---|---|
 | `train_result.pkl` | Full `TrainResult` object (needed by `predictive bundle`) |
-| `training_meta.json` | Row count + 5-fold CV metrics |
-| `model_quality_score.onnx` | Regression ONNX model |
-| `model_defect_burn_mark.onnx` | Classification ONNX model |
-| `model_defect_flash.onnx` | Classification ONNX model |
-| `model_defect_sink_mark.onnx` | Classification ONNX model |
-| `model_defect_weld_line.onnx` | Classification ONNX model |
+| `scope.json` | Scope metadata carried forward into `predictive bundle` |
 
 **Acceptable CV metrics (minimum thresholds before deploying):**
 
@@ -149,11 +144,15 @@ Outputs written to `runs\mold-a-v1\`:
 ```powershell
 moldvision predictive bundle `
   --train-dir runs\mold-a-v1 `
-  --output-dir bundles\mold-a-v1 `
-  --pack
+  --model-name "Mold A Startup Suggestion" `
+  --model-version 1.0.0 `
+  --sugbundle
 ```
 
-Produces `bundles\mold-a-v1\mold-a-startup-suggestion-v1.0.0.sugbundle`.
+Produces:
+
+- `runs\mold-a-v1\deploy\<bundle_id>\` (bundle directory)
+- `runs\mold-a-v1\deploy\<bundle_id>.sugbundle` when `--sugbundle` is passed
 
 ### 5. Install in MoldPilot
 

@@ -82,6 +82,7 @@ def write_suggestion_bundle(
     dataset_source: Optional[str] = None,
     mold_id: Optional[str] = None,
     material_id: Optional[str] = None,
+    machine_id: Optional[str] = None,
 ) -> Path:
     """Write a startup-suggestion bundle directory.
 
@@ -110,6 +111,10 @@ def write_suggestion_bundle(
         Mold identifier this bundle was trained for (scope axis 1).
     material_id:
         Material identifier this bundle was trained for (scope axis 2).
+    machine_id:
+        Machine identifier (or family) this bundle was trained for (scope axis 3).
+        A model trained on data from a specific machine family will only produce
+        reliable suggestions when run on the same family.
 
     Returns
     -------
@@ -181,6 +186,7 @@ def write_suggestion_bundle(
         "scope": {
             "mold_id":     mold_id,
             "material_id": material_id,
+            "machine_id":  machine_id,
         },
     }
     _save_json(bundle_dir / "manifest.json", manifest)

@@ -335,15 +335,16 @@ All five ONNX models follow the same contract:
 moldvision predictive train `
   --input C:\data\training_rows.jsonl `
   --output-dir runs\suggest-v1 `
-  --model-name "Mold A Startup Suggestion" `
-  --model-version 1.0.0
+  --mold-id mold_a12 `
+  --material-id pp_natureworks_4032d
 
 # 3. Pack the suggestion bundle
 moldvision predictive bundle `
   --train-dir runs\suggest-v1 `
-  --output-dir bundles\suggest-v1 `
-  --pack
-# → bundles\suggest-v1\mold-a-startup-suggestion-v1.0.0.sugbundle
+  --model-name "Mold A Startup Suggestion" `
+  --model-version 1.0.0 `
+  --sugbundle
+# → runs\suggest-v1\deploy\<bundle_id>.sugbundle
 ```
 
 ### Installing a `.sugbundle` (MoldPilot)

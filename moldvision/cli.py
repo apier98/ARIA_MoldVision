@@ -660,6 +660,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--material-id", default=None,
         help="Material ID to scope this training run. Only rows with matching material_id are used.",
     )
+    pred_train.add_argument(
+        "--machine-id", default=None,
+        help=(
+            "Machine ID (or family) to scope this training run. "
+            "Only rows whose context.machine_family matches are used. "
+            "Recommended when your dataset contains data from multiple machine types "
+            "with different HMI schemas."
+        ),
+    )
+    pred_train.add_argument(
+        "--allow-scope-filtering", action="store_true",
+        help=(
+            "When scope flags are provided, drop rows outside that scope instead of failing. "
+            "Use only for exploratory pooled datasets; production training should export one JSONL per scope."
+        ),
+    )
 
     pred_bundle = pred_sub.add_parser(
         "bundle",
@@ -696,6 +712,10 @@ def build_parser() -> argparse.ArgumentParser:
     pred_bundle.add_argument(
         "--material-id", default=None,
         help="Material ID to encode in the bundle scope block (optional, recommended)",
+    )
+    pred_bundle.add_argument(
+        "--machine-id", default=None,
+        help="Machine ID to encode in the bundle scope block (optional, recommended)",
     )
 
     # ---- publish ----

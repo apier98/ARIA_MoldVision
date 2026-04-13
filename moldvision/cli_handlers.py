@@ -1538,8 +1538,10 @@ def handle_predictive(args) -> int:
 
 def _handle_predictive_validate_dataset(args) -> int:
     from .predictive.training_row_loader import (
+        assess_training_readiness,
         filter_eligible,
         load_training_rows,
+        summarize_scope_distribution,
         summarize_dataset,
         validate_dataset,
     )
@@ -1612,6 +1614,15 @@ def _handle_predictive_validate_dataset(args) -> int:
                 print(f"  ⚠  {sc['null_mold_id']} row(s) missing mold_id")
             if sc.get("null_material_id", 0):
                 print(f"  ⚠  {sc['null_material_id']} row(s) missing material_id")
+            for scope in sc.get("scopes", [])[:10]:
+                print(f"  scope: mold_id={scope[0]!r}  material_id={scope[1]!r}")
+            for family in sc.get("machine_families", [])[:10]:
+                print(f"  machine_family: {family}")
+        readiness = summary.get("training_readiness") or assess_training_readiness(summary["eligible_rows"])
+        print(
+            f"Training readiness:{readiness['level']:>12}  "
+            f"{readiness['message']}"
+        )
 
     return 0 if report["valid"] else 3
 
@@ -1625,13 +1636,20 @@ def _handle_predictive_train(args) -> int:
     """
     import pickle
 
-    from .predictive.training_row_loader import load_training_rows
+    from .predictive.training_row_loader import (
+        assess_training_readiness,
+        check_schema_homogeneity,
+        summarize_scope_distribution,
+        load_training_rows,
+        validate_dataset,
+    )
     from .predictive.trainer import GbtTrainingConfig, train_suggestion_models
 
     input_path = resolve_path(args.input)
     output_dir = resolve_path(args.output_dir)
     scope_mold_id: str | None = getattr(args, "mold_id", None)
     scope_material_id: str | None = getattr(args, "material_id", None)
+    scope_machine_id: str | None = getattr(args, "machine_id", None)
 
     if not input_path.exists():
         print(f"ERROR: File not found: {input_path}")
@@ -1648,24 +1666,86 @@ def _handle_predictive_train(args) -> int:
         print("ERROR: File contains zero rows.")
         return 2
 
-    # Scope filtering — keep only rows that match declared mold_id / material_id.
-    if scope_mold_id or scope_material_id:
-        original_count = len(rows)
-        if scope_mold_id:
-            rows = [r for r in rows if r.get("mold_id") == scope_mold_id]
-        if scope_material_id:
-            rows = [r for r in rows if r.get("material_id") == scope_material_id]
-        dropped = original_count - len(rows)
+    report = validate_dataset(rows)
+    if not report["valid"]:
+        print(
+            f"ERROR: Dataset contains {report['invalid_rows']} invalid row(s). "
+            "Run 'moldvision predictive validate-dataset --summary' and fix the input before training."
+        )
+        for entry in report["row_errors"][:10]:
+            sid = entry.get("session_id", "?")
+            cid = entry.get("component_id", "?")
+            for err in entry["errors"]:
+                print(f"  [{entry['index']}] session={sid} component={cid}: {err}")
+        if len(report["row_errors"]) > 10:
+            print(f"  ... and {len(report['row_errors']) - 10} more")
+        return 2
+
+    scope_distribution = summarize_scope_distribution(rows)
+    if scope_distribution["distinct_scope_count"] > 1 and not (scope_mold_id or scope_material_id):
+        print(
+            "WARNING: Dataset contains multiple mold/material scopes. "
+            "For production training, prefer one JSONL per scope or pass --mold-id/--material-id explicitly."
+        )
+
+    # Scope preflight / filtering.
+    if scope_mold_id or scope_material_id or scope_machine_id:
+        def _matches_scope(row: dict) -> bool:
+            if scope_mold_id and row.get("mold_id") != scope_mold_id:
+                return False
+            if scope_material_id and row.get("material_id") != scope_material_id:
+                return False
+            if scope_machine_id and (row.get("context") or {}).get("machine_family") != scope_machine_id:
+                return False
+            return True
+
+        matching_rows = [r for r in rows if _matches_scope(r)]
+        dropped = len(rows) - len(matching_rows)
+        if dropped and not getattr(args, "allow_scope_filtering", False):
+            print(
+                "ERROR: Dataset includes rows outside the declared training scope. "
+                "Export one JSONL per scope, or re-run with --allow-scope-filtering to drop mismatches explicitly."
+            )
+            print(
+                f"       Declared scope: mold_id={scope_mold_id!r}  material_id={scope_material_id!r}  "
+                f"machine_id={scope_machine_id!r}"
+            )
+            print(f"       Rows outside scope: {dropped}")
+            return 2
+        rows = matching_rows
         if dropped:
-            print(f"Scope filter: dropped {dropped} rows not matching mold_id={scope_mold_id!r} / material_id={scope_material_id!r}")
+            print(
+                f"Scope filter: dropped {dropped} rows not matching "
+                f"mold_id={scope_mold_id!r} / material_id={scope_material_id!r} / "
+                f"machine_id={scope_machine_id!r}"
+            )
         if not rows:
-            print("ERROR: No rows remain after scope filtering. Check --mold-id / --material-id values.")
+            print(
+                "ERROR: No rows remain after scope filtering. "
+                "Check --mold-id / --material-id / --machine-id values."
+            )
             return 2
 
     # Warn if material_id is absent across all rows (data collection gap).
     null_material = sum(1 for r in rows if not r.get("material_id"))
     if null_material:
-        print(f"WARNING: {null_material}/{len(rows)} rows have no material_id — consider passing --material-id to scope training correctly.")
+        print(
+            f"WARNING: {null_material}/{len(rows)} rows have no material_id — "
+            "consider passing --material-id to scope training correctly."
+        )
+
+    # Warn on heterogeneous HMI schemas — training on mixed machine types degrades model quality.
+    homogeneity = check_schema_homogeneity(rows)
+    if not homogeneity["homogeneous"]:
+        layouts = homogeneity.get("hmi_layouts_seen", [])
+        families = sorted({lay.get("machine_family") for lay in layouts if lay.get("machine_family")})
+        print(
+            f"WARNING: Dataset contains {homogeneity['n_schemas']} distinct HMI schemas "
+            f"(machine families: {families}). "
+            "Training on heterogeneous schemas produces a union-schema model with sparse features "
+            "that may have degraded accuracy. "
+            "Recommended: re-run with --machine-id <family> to train one model per machine family."
+        )
 
     cfg = GbtTrainingConfig(
         n_estimators=args.n_estimators,
@@ -1674,6 +1754,13 @@ def _handle_predictive_train(args) -> int:
         null_strategy=args.null_strategy,
     )
 
+    eligible_count = sum(
+        1 for r in rows if (r.get("eligibility") or {}).get("training_ready")
+    )
+    readiness = assess_training_readiness(eligible_count)
+    print(
+        f"Training readiness: {readiness['level']}  ·  {readiness['message']}"
+    )
     print(f"Training on up to {len(rows)} rows  (cv_folds={cfg.cv_folds}, n_estimators={cfg.n_estimators}) ...")
     try:
         result = train_suggestion_models(rows, config=cfg)
@@ -1704,14 +1791,24 @@ def _handle_predictive_train(args) -> int:
     import json
     scope_path = output_dir / "scope.json"
     scope_path.write_text(
-        json.dumps({"mold_id": scope_mold_id, "material_id": scope_material_id}, indent=2),
+        json.dumps(
+            {
+                "mold_id": scope_mold_id,
+                "material_id": scope_material_id,
+                "machine_id": scope_machine_id,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
     print(f"\nArtifacts written to: {output_dir}")
     print(f"  {pkl_path.name}")
-    if scope_mold_id or scope_material_id:
-        print(f"  scope.json  (mold_id={scope_mold_id!r}, material_id={scope_material_id!r})")
+    if scope_mold_id or scope_material_id or scope_machine_id:
+        print(
+            f"  scope.json  (mold_id={scope_mold_id!r}, "
+            f"material_id={scope_material_id!r}, machine_id={scope_machine_id!r})"
+        )
     return 0
 
 
@@ -1738,6 +1835,7 @@ def _handle_predictive_bundle(args) -> int:
     # Load scope from scope.json written by 'predictive train', overridden by explicit flags.
     scope_mold_id: str | None = getattr(args, "mold_id", None)
     scope_material_id: str | None = getattr(args, "material_id", None)
+    scope_machine_id: str | None = getattr(args, "machine_id", None)
     scope_path = train_dir / "scope.json"
     if scope_path.exists():
         saved_scope = json.loads(scope_path.read_text(encoding="utf-8"))
@@ -1745,6 +1843,8 @@ def _handle_predictive_bundle(args) -> int:
             scope_mold_id = saved_scope.get("mold_id")
         if scope_material_id is None:
             scope_material_id = saved_scope.get("material_id")
+        if scope_machine_id is None:
+            scope_machine_id = saved_scope.get("machine_id")
 
     if not scope_mold_id or not scope_material_id:
         print("WARNING: Bundle scope is incomplete — mold_id or material_id is not set.")
@@ -1767,14 +1867,18 @@ def _handle_predictive_bundle(args) -> int:
             supersedes=args.supersedes,
             mold_id=scope_mold_id,
             material_id=scope_material_id,
+            machine_id=scope_machine_id,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"ERROR: Bundle write failed — {exc}")
         return 2
 
     print(f"  Bundle directory: {bundle_dir}")
-    if scope_mold_id or scope_material_id:
-        print(f"  Scope: mold_id={scope_mold_id!r}  material_id={scope_material_id!r}")
+    if scope_mold_id or scope_material_id or scope_machine_id:
+        print(
+            f"  Scope: mold_id={scope_mold_id!r}  material_id={scope_material_id!r}  "
+            f"machine_id={scope_machine_id!r}"
+        )
 
     if args.sugbundle:
         archive = pack_sugbundle(bundle_dir)
