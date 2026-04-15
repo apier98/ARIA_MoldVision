@@ -276,6 +276,11 @@ def extract_parameter_schema(
             if entry is None:
                 entry = {
                     "parameter_id": parameter_id,
+                    "raw_parameter_id": str(item.get("raw_parameter_id", "")).strip() or None,
+                    "parameter_id_base": str(item.get("parameter_id_base", "")).strip() or None,
+                    "slot_id": str(item.get("slot_id", "")).strip() or None,
+                    "canonical_parameter_id": str(item.get("canonical_parameter_id", "")).strip() or None,
+                    "canonical_slot_id": str(item.get("canonical_slot_id", "")).strip() or None,
                     "display_name": str(item.get("display_name", "")).strip() or parameter_id,
                     "unit": str(item.get("unit", "")).strip() or "setpoint",
                     "baseline": float(item.get("baseline", 0.0)),
@@ -291,6 +296,15 @@ def extract_parameter_schema(
             for key in control_feature_keys:
                 if key not in entry["control_feature_keys"]:
                     entry["control_feature_keys"].append(key)
+            for field_name in (
+                "raw_parameter_id",
+                "parameter_id_base",
+                "slot_id",
+                "canonical_parameter_id",
+                "canonical_slot_id",
+            ):
+                if entry.get(field_name) is None and item.get(field_name) not in (None, ""):
+                    entry[field_name] = str(item.get(field_name)).strip() or None
             if entry["display_name"] == parameter_id and item.get("display_name"):
                 entry["display_name"] = str(item.get("display_name")).strip() or parameter_id
             if entry["unit"] == "setpoint" and item.get("unit"):

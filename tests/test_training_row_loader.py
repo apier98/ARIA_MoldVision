@@ -249,15 +249,18 @@ class TestFeatureExtraction(unittest.TestCase):
             _make_row(
                 parameter_schema=[
                     {
-                        "parameter_id": "temp_barrel",
+                        "parameter_id": "temp_barrel:zone_1",
+                        "canonical_parameter_id": "temp_barrel",
+                        "slot_id": "zone_1",
+                        "canonical_slot_id": "zone_1",
                         "display_name": "Barrel Temperature",
                         "unit": "C",
                         "baseline": 220.0,
                         "range_min": 180.0,
                         "range_max": 320.0,
                         "control_feature_keys": [
-                            "temp_barrel:actual.setpoint_end",
-                            "temp_barrel:actual.setpoint",
+                            "temp_barrel:zone_1.setpoint_end",
+                            "temp_barrel:zone_1.setpoint",
                         ],
                         "step_mode": "absolute",
                         "preferred_step": 1.0,
@@ -267,11 +270,13 @@ class TestFeatureExtraction(unittest.TestCase):
             )
         ]
 
-        schema = extract_parameter_schema(rows, feature_keys=["temp_barrel:actual.setpoint_end"])
+        schema = extract_parameter_schema(rows, feature_keys=["temp_barrel:zone_1.setpoint_end"])
 
         self.assertEqual(len(schema), 1)
-        self.assertEqual(schema[0]["parameter_id"], "temp_barrel")
-        self.assertEqual(schema[0]["control_feature_keys"], ["temp_barrel:actual.setpoint_end"])
+        self.assertEqual(schema[0]["parameter_id"], "temp_barrel:zone_1")
+        self.assertEqual(schema[0]["canonical_parameter_id"], "temp_barrel")
+        self.assertEqual(schema[0]["slot_id"], "zone_1")
+        self.assertEqual(schema[0]["control_feature_keys"], ["temp_barrel:zone_1.setpoint_end"])
 
 
 class TestExtractTargets(unittest.TestCase):
