@@ -1549,6 +1549,8 @@ def _handle_lake_pools_add(args, *, pool: str) -> int:
 
 def handle_predictive(args) -> int:
     subcmd = getattr(args, "predictive_cmd", None)
+    if subcmd == "list-artifacts":
+        return _handle_predictive_list_artifacts(args)
     if subcmd == "validate-dataset":
         return _handle_predictive_validate_dataset(args)
     if subcmd == "train":
@@ -1557,6 +1559,113 @@ def handle_predictive(args) -> int:
         return _handle_predictive_bundle(args)
     print(f"Unknown predictive sub-command: {subcmd}")
     return 2
+
+
+def _handle_predictive_list_artifacts(args) -> int:
+    shared_root = (
+        resolve_path(args.shared_root)
+        if getattr(args, "shared_root", None)
+        else appconfig.get_shared_root()
+    )
+    if shared_root is None:
+        print("ERROR: ARIA shared root is not configured.")
+        print("       Set ARIA_SHARED_ROOT or pass --shared-root.")
+        return 2
+
+    exports_root = shared_root / "ingest" / "moldtrace" / "training_rows" / "v1"
+    records = _collect_predictive_artifacts(exports_root)
+    if args.session_id:
+        records = [r for r in records if r["session_id"] == args.session_id]
+    if args.mold_id:
+        records = [r for r in records if r["mold_id"] == args.mold_id]
+    if args.material_id:
+        records = [r for r in records if r["material_id"] == args.material_id]
+    if args.machine_family:
+        records = [r for r in records if r["machine_family"] == args.machine_family]
+
+    limit = max(1, int(getattr(args, "limit", 50)))
+    records = records[:limit]
+    if getattr(args, "json", False):
+        print(json.dumps(records, indent=2))
+        return 0
+
+    print(f"Found {len(records)} predictive artifact(s) under {exports_root}")
+    for record in records:
+        print(
+            f"- {record['export_id']}  staged={record['staged_at_utc']}  "
+            f"mold={record['mold_id'] or '-'}  material={record['material_id'] or '-'}  "
+            f"family={record['machine_family'] or '-'}  "
+            f"rows={record['rows_total']}  ready={record['rows_training_ready']}  "
+            f"gate={record['gate_status']}"
+        )
+        print(f"  input={record['training_rows_path']}")
+        print(f"  session={record['session_id']}  root={record['export_root']}")
+    return 0
+
+
+def _collect_predictive_artifacts(exports_root: Path) -> list[dict]:
+    if not exports_root.exists():
+        return []
+
+    records: list[dict] = []
+    for session_dir in sorted((p for p in exports_root.iterdir() if p.is_dir()), reverse=True):
+        for export_dir in sorted((p for p in session_dir.iterdir() if p.is_dir()), reverse=True):
+            manifest = _read_optional_json(export_dir / "export_manifest.json")
+            if not manifest:
+                continue
+            session_meta = _read_optional_json(export_dir / "session.json")
+            rows_summary = _read_optional_json(export_dir / "training_rows_summary.json")
+            quality_gate = _read_optional_json(export_dir / "quality_gate_summary.json")
+            counts = rows_summary.get("counts") if isinstance(rows_summary.get("counts"), dict) else {}
+            gate_counts = quality_gate.get("counts") if isinstance(quality_gate.get("counts"), dict) else {}
+            machine_context = {}
+            critical_slot_policy = rows_summary.get("critical_slot_policy")
+            if isinstance(critical_slot_policy, dict):
+                machine_context = critical_slot_policy.get("machine_context") or {}
+            hmi_layouts = rows_summary.get("features", {}).get("hmi_layouts_seen", [])
+            first_layout = hmi_layouts[0] if hmi_layouts else {}
+            records.append(
+                {
+                    "session_id": manifest.get("session_id") or session_dir.name,
+                    "export_id": manifest.get("export_id") or export_dir.name,
+                    "staged_at_utc": manifest.get("staged_at_utc") or "",
+                    "mold_id": session_meta.get("mold_id"),
+                    "material_id": session_meta.get("material_id"),
+                    "machine_id": session_meta.get("machine_id"),
+                    "machine_family": (
+                        machine_context.get("machine_family")
+                        or first_layout.get("machine_family")
+                    ),
+                    "layout_id": (
+                        machine_context.get("layout_id")
+                        or first_layout.get("hmi_layout_id")
+                    ),
+                    "rows_total": counts.get("rows_total", 0),
+                    "rows_training_ready": counts.get(
+                        "rows_training_ready",
+                        quality_gate.get("outputs", {}).get("training_ready_count", 0),
+                    ),
+                    "components_total": gate_counts.get("components_total", 0),
+                    "components_training_ready": gate_counts.get("components_training_ready", 0),
+                    "gate_status": (quality_gate.get("gate") or {}).get("status", "unknown"),
+                    "gate_passed": (quality_gate.get("gate") or {}).get("passed"),
+                    "training_rows_path": str(export_dir / "training_rows.jsonl"),
+                    "export_root": str(export_dir),
+                }
+            )
+
+    records.sort(key=lambda record: (record["staged_at_utc"], record["export_id"]), reverse=True)
+    return records
+
+
+def _read_optional_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _handle_predictive_validate_dataset(args) -> int:
@@ -1915,6 +2024,26 @@ def _handle_predictive_bundle(args) -> int:
     if args.sugbundle:
         archive = pack_sugbundle(bundle_dir)
         print(f"  Packed archive:   {archive}")
+
+    if getattr(args, "publish", False):
+        from moldvision.publish import publish_bundle
+
+        try:
+            publish_result = publish_bundle(
+                bundle_dir,
+                role="startup_suggestion",
+                channel=args.channel,
+                dry_run=getattr(args, "publish_dry_run", False),
+            )
+        except Exception as exc:
+            print(f"ERROR: Publishing failed — {exc}")
+            return 2
+
+        if getattr(args, "publish_dry_run", False):
+            print("  Publish dry-run:")
+        else:
+            print("  Published:")
+        print(json.dumps(publish_result, indent=2))
 
     print("\nDone.")
     return 0

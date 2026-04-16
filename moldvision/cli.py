@@ -607,6 +607,18 @@ def build_parser() -> argparse.ArgumentParser:
     pred = sub.add_parser("predictive", help="Predictive model tooling (startup suggestion models)")
     pred_sub = pred.add_subparsers(dest="predictive_cmd", required=True)
 
+    pred_ls = pred_sub.add_parser(
+        "list-artifacts",
+        help="List shared MoldTrace training-row exports available for predictive training",
+    )
+    pred_ls.add_argument("--shared-root", default=None, help="Override ARIA shared root")
+    pred_ls.add_argument("--session-id", default=None, help="Filter by MoldTrace session UUID")
+    pred_ls.add_argument("--mold-id", default=None, help="Filter by mold_id")
+    pred_ls.add_argument("--material-id", default=None, help="Filter by material_id")
+    pred_ls.add_argument("--machine-family", default=None, help="Filter by machine family")
+    pred_ls.add_argument("--limit", type=int, default=50, help="Maximum number of exports to print")
+    pred_ls.add_argument("--json", action="store_true", help="Print machine-readable JSON output")
+
     pred_val = pred_sub.add_parser(
         "validate-dataset",
         help="Validate a training_row_v1 JSONL file produced by MoldTrace",
@@ -720,6 +732,14 @@ def build_parser() -> argparse.ArgumentParser:
     pred_bundle.add_argument(
         "--machine-id", default=None,
         help="Machine ID to encode in the bundle scope block (optional, recommended)",
+    )
+    pred_bundle.add_argument(
+        "--publish", action="store_true",
+        help="Immediately publish the generated suggestion bundle using role startup_suggestion",
+    )
+    pred_bundle.add_argument(
+        "--publish-dry-run", action="store_true",
+        help="Dry-run the publish step and print the resulting catalog/index metadata",
     )
 
     # ---- publish ----
