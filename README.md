@@ -13,9 +13,11 @@ Integrated system for computer-vision defect detection and predictive startup-su
 - Normalize COCO category ids to contiguous `0..N-1` (fixes common training issues)
 - Train defect detection models (detect or seg)
 - Train predictive startup-suggestion models from MoldTrace `training_row_v1` JSONL exports
+- List shared MoldTrace predictive-training exports from `shared\ingest\moldtrace\training_rows\v1\...`
 - Export trained models to ONNX (and optionally build TensorRT engines)
 - Create deployment bundles compatible with ARIA MoldPilot (`.mpk` format, versioned, checksummed)
 - Package predictive models into deployable `.sugbundle` archives for MoldPilot's Tier 1 Startup Assistant
+- Publish defect-detection, suggestion, and MoldTrace runtime bundles into the shared `published\...` tree
 - Pre-label new images with a trained model via Label Studio (active learning loop)
 - Store persistent defaults (dataset root, num-workers, backend, export format)
 - Run `doctor` to check your environment and print common fix hints
@@ -53,7 +55,7 @@ pip install "aria-moldvision[label-studio]"
 
 ## Configuration
 
-MoldVision stores persistent defaults in `%LOCALAPPDATA%\ARIA\MoldVision\config.json` (Windows) or the appropriate platform config directory.
+MoldVision stores persistent defaults in `%LOCALAPPDATA%\ARIA\MoldVision\config.json` (Windows) or the appropriate platform config directory. When `ARIA_SHARED_ROOT` is set, the lake defaults to `shared\lake`, shared predictive export discovery reads from `shared\ingest\moldtrace\training_rows\v1`, and `moldvision publish` targets the shared `published\...` tree automatically.
 
 ```powershell
 moldvision config show                          # print all current settings
@@ -63,7 +65,7 @@ moldvision config set inference-backend onnx    # default backend for moldvision
 moldvision config set export-format onnx_fp16   # default format for moldvision export
 ```
 
-Settings are overridden by explicit CLI flags and by environment variables (`MOLDVISION_DATASET_ROOT`, `MOLDVISION_NUM_WORKERS`, `MOLDVISION_BACKEND`, `MOLDVISION_EXPORT_FORMAT`).
+Settings are overridden by explicit CLI flags and by environment variables (`MOLDVISION_DATASETS`, `MOLDVISION_NUM_WORKERS`, `MOLDVISION_BACKEND`, `MOLDVISION_EXPORT_FORMAT`).
 
 > **Windows tip:** `num-workers` defaults to `0` to avoid DataLoader multiprocessing issues. Set it once with `config set` instead of passing `--num-workers 0` on every training run.
 
@@ -210,7 +212,15 @@ defect detection.
 pip install "aria-moldvision[predictive]"
 ```
 
-### 2) Validate the MoldTrace export
+### 2) Discover or validate the MoldTrace export
+
+If you are working from the shared stack storage, list the available exports first:
+
+```powershell
+moldvision predictive list-artifacts
+```
+
+Then validate a specific JSONL:
 
 ```powershell
 moldvision predictive validate-dataset `
@@ -246,7 +256,8 @@ moldvision predictive bundle `
   --train-dir runs\mold-a-v1 `
   --model-name "Mold A Startup Suggestion" `
   --model-version 1.0.0 `
-  --sugbundle
+  --sugbundle `
+  --publish
 ```
 
 This produces:
@@ -258,11 +269,11 @@ This produces:
 For production, keep scope complete so MoldPilot can select the correct bundle
 for the active mold/material.
 
-### 5) Install in MoldPilot
+### 5) Publish or install in MoldPilot
 
-Copy the `.sugbundle` to the MoldPilot machine and install it through MoldPilot's
-model registry flow. Once installed, MoldPilot upgrades the Startup Assistant
-from Tier 0 (rule-based) to Tier 1 (predictive bundle).
+With `--publish`, MoldVision publishes the bundle into `shared\published\moldpilot\suggestions\...`, and MoldPilot can sync it automatically on startup when `ARIA_SHARED_ROOT` is configured.
+
+If you omit `--publish`, copy the `.sugbundle` to the MoldPilot machine and install it through MoldPilot's local model registry flow.
 
 > For the full predictive pipeline, scope rules, expected metrics, and bundle
 > internals, see `docs/MoldVision_Predictive_Model_Plan.md` and
