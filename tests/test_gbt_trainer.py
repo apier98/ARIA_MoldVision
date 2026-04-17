@@ -194,6 +194,74 @@ class TestGbtTrainer(unittest.TestCase):
         result = train_suggestion_models(rows, config=cfg)
         self.assertNotIn("rare_slot:actual.mean", result.feature_keys)
 
+    def test_selected_feature_stats_keep_only_setpoint_end_and_present(self) -> None:
+        from moldvision.predictive.trainer import GbtTrainingConfig, train_suggestion_models
+        rows = []
+        for i in range(12):
+            rows.append(
+                {
+                    "schema_version": "training_row_v2",
+                    "session_id": f"sess_{i:03d}",
+                    "component_id": f"cmp_{i:03d}",
+                    "eligibility": {
+                        "training_ready": True,
+                        "base_quality_gate_ready": True,
+                        "coverage_ratio": 0.95,
+                    },
+                    "features": {
+                        "pressure_injection:step_1.setpoint_end": 800.0 + i,
+                        "pressure_injection:step_1.present": 1.0,
+                        "pressure_injection:step_1.changed": float(i % 2),
+                        "pressure_injection:step_1.n_changes": float(i % 3),
+                    },
+                    "targets": {
+                        "y_quality_score": 0.5 + i * 0.01,
+                        "y_defect_flash": int(i % 3 == 0),
+                        "y_defect_sink_mark": 0,
+                        "y_defect_burn_mark": 0,
+                        "y_defect_weld_line": 0,
+                    },
+                    "context": {
+                        "defect_classes_monitored": ["flash"],
+                        "feature_keys": [
+                            "pressure_injection:step_1.setpoint_end",
+                            "pressure_injection:step_1.present",
+                            "pressure_injection:step_1.changed",
+                            "pressure_injection:step_1.n_changes",
+                        ],
+                        "parameter_schema": [
+                            {
+                                "parameter_id": "pressure_injection:step_1",
+                                "display_name": "Injection Pressure - Step 1",
+                                "unit": "bar",
+                                "baseline": 800.0,
+                                "range_min": 500.0,
+                                "range_max": 1200.0,
+                                "control_feature_keys": [
+                                    "pressure_injection:step_1.setpoint_end",
+                                ],
+                                "step_mode": "absolute",
+                                "preferred_step": 10.0,
+                                "max_delta": 50.0,
+                            }
+                        ],
+                    },
+                }
+            )
+        cfg = GbtTrainingConfig(n_estimators=5, cv_folds=2, min_rows=5)
+        result = train_suggestion_models(rows, config=cfg)
+        self.assertEqual(
+            result.feature_keys,
+            [
+                "pressure_injection:step_1.present",
+                "pressure_injection:step_1.setpoint_end",
+            ],
+        )
+        self.assertEqual(
+            result.parameter_schema[0]["control_feature_keys"],
+            ["pressure_injection:step_1.setpoint_end"],
+        )
+
 
 @unittest.skipUnless(_PREDICTIVE_AVAILABLE, "lightgbm / scikit-learn not installed")
 class TestOnnxExport(unittest.TestCase):

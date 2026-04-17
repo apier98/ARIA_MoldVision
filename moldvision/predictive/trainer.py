@@ -66,6 +66,7 @@ class GbtTrainingConfig:
     early_stopping_rounds: int = 30
     null_strategy: Literal["native_missing", "mean_impute", "zero_impute"] = "native_missing"
     min_feature_presence_ratio: float = 0.05
+    selected_feature_stats: Tuple[str, ...] = ("setpoint_end", "present")
     #: Minimum eligible rows required to attempt training.
     min_rows: int = 10
 
@@ -190,6 +191,33 @@ def _prune_sparse_features(
     return kept_matrix, kept_keys, kept_ratios
 
 
+def _selected_feature_keys(
+    feature_keys: Sequence[str],
+    *,
+    selected_stats: Sequence[str],
+) -> List[str]:
+    allowed_stats = {
+        str(stat).strip()
+        for stat in selected_stats
+        if str(stat).strip()
+    }
+    if not allowed_stats:
+        return list(feature_keys)
+
+    filtered: List[str] = []
+    for key in feature_keys:
+        _, dot, stat = str(key).partition(".")
+        if not dot:
+            filtered.append(str(key))
+            continue
+        if stat in allowed_stats:
+            filtered.append(str(key))
+
+    # Preserve backward compatibility for legacy datasets that only contain
+    # older stat names such as ".actual.mean".
+    return filtered or list(feature_keys)
+
+
 # ---------------------------------------------------------------------------
 # Core training function
 # ---------------------------------------------------------------------------
@@ -246,10 +274,14 @@ def train_suggestion_models(
     # Build feature matrix with union schema (None for missing columns), then
     # prune ultra-sparse features before training.
     union_feature_keys = infer_feature_keys(eligible)
-    raw_matrix, _ = align_to_union_schema(eligible, union_keys=union_feature_keys)
+    selected_feature_keys = _selected_feature_keys(
+        union_feature_keys,
+        selected_stats=config.selected_feature_stats,
+    )
+    raw_matrix, _ = align_to_union_schema(eligible, union_keys=selected_feature_keys)
     raw_matrix, feature_keys, feature_presence = _prune_sparse_features(
         raw_matrix,
-        union_feature_keys,
+        selected_feature_keys,
         min_presence_ratio=config.min_feature_presence_ratio,
     )
     parameter_schema = extract_parameter_schema(eligible, feature_keys=feature_keys)

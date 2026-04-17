@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aria-moldvision"
-version = "0.1.0"
+version = "0.1.1"
 description = "CLI workspace to create datasets and train defect detection models (ARIA_MoldVision)."
 requires-python = ">=3.9"
 readme = "README.md"

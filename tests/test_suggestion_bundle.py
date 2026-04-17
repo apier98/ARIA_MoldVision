@@ -163,7 +163,18 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             self.assertIn("n_eligible_rows", meta)
             self.assertIn("cv_metrics", meta)
             self.assertEqual(meta["null_strategy"], "native_missing")
+            self.assertEqual(meta["selected_feature_stats"], ["setpoint_end", "present"])
             self.assertIn("min_feature_presence_ratio", meta["lgbm_config"])
+
+    def test_manifest_records_selected_feature_stats(self) -> None:
+        from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
+        result = self._train()
+        with tempfile.TemporaryDirectory() as td:
+            bundle_dir = write_suggestion_bundle(
+                Path(td), result, model_name="startup-suggestion", model_version="0.0.1"
+            )
+            manifest = json.loads((bundle_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["selected_feature_stats"], ["setpoint_end", "present"])
 
     def test_pack_sugbundle_creates_zip(self) -> None:
         from moldvision.predictive.suggestion_bundle import pack_sugbundle, write_suggestion_bundle

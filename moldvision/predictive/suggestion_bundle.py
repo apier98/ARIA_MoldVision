@@ -151,6 +151,7 @@ def write_suggestion_bundle(
         "n_eligible_rows": train_result.n_eligible_rows,
         "n_features": len(train_result.feature_keys),
         "null_strategy": train_result.null_strategy,
+        "selected_feature_stats": list(train_result.config.selected_feature_stats),
         "cv_metrics": cv_metrics,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_source": dataset_source,
@@ -182,6 +183,7 @@ def write_suggestion_bundle(
             k: round(v, 8) for k, v in train_result.imputation_values.items()
         },
         "null_strategy":   train_result.null_strategy,
+        "selected_feature_stats": list(train_result.config.selected_feature_stats),
         "target_models":   target_models,
         "quality_weights": weights,
         "checksums":       checksums,

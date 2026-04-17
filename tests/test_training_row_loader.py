@@ -250,6 +250,8 @@ class TestFeatureExtraction(unittest.TestCase):
                 parameter_schema=[
                     {
                         "parameter_id": "temp_barrel:zone_1",
+                        "page_id": "temperature",
+                        "subpage_id": "barrel",
                         "canonical_parameter_id": "temp_barrel",
                         "slot_id": "zone_1",
                         "canonical_slot_id": "zone_1",
@@ -274,6 +276,8 @@ class TestFeatureExtraction(unittest.TestCase):
 
         self.assertEqual(len(schema), 1)
         self.assertEqual(schema[0]["parameter_id"], "temp_barrel:zone_1")
+        self.assertEqual(schema[0]["page_id"], "temperature")
+        self.assertEqual(schema[0]["subpage_id"], "barrel")
         self.assertEqual(schema[0]["canonical_parameter_id"], "temp_barrel")
         self.assertEqual(schema[0]["slot_id"], "zone_1")
         self.assertEqual(schema[0]["control_feature_keys"], ["temp_barrel:zone_1.setpoint_end"])

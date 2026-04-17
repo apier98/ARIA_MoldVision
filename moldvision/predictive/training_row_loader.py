@@ -278,6 +278,8 @@ def extract_parameter_schema(
                     "parameter_id": parameter_id,
                     "raw_parameter_id": str(item.get("raw_parameter_id", "")).strip() or None,
                     "parameter_id_base": str(item.get("parameter_id_base", "")).strip() or None,
+                    "page_id": str(item.get("page_id", "")).strip() or None,
+                    "subpage_id": str(item.get("subpage_id", "")).strip() or None,
                     "slot_id": str(item.get("slot_id", "")).strip() or None,
                     "canonical_parameter_id": str(item.get("canonical_parameter_id", "")).strip() or None,
                     "canonical_slot_id": str(item.get("canonical_slot_id", "")).strip() or None,
@@ -299,6 +301,8 @@ def extract_parameter_schema(
             for field_name in (
                 "raw_parameter_id",
                 "parameter_id_base",
+                "page_id",
+                "subpage_id",
                 "slot_id",
                 "canonical_parameter_id",
                 "canonical_slot_id",
