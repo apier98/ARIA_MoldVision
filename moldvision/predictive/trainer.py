@@ -8,10 +8,10 @@ no Python ML dependencies on the shop floor.
 Targets
 -------
 - ``quality_score``     — regression  (``y_quality_score``, float 0–1)
-- ``defect_burn_mark``  — binary classification (``y_defect_burn_mark``, 0/1)
-- ``defect_flash``      — binary classification (``y_defect_flash``, 0/1)
-- ``defect_sink_mark``  — binary classification (``y_defect_sink_mark``, 0/1)
-- ``defect_weld_line``  — binary classification (``y_defect_weld_line``, 0/1)
+- ``defect_burn_mark``  — regression  (``y_burden_burn_mark``, float 0–1)
+- ``defect_flash``      — regression  (``y_burden_flash``, float 0–1)
+- ``defect_sink_mark``  — regression  (``y_burden_sink_mark``, float 0–1)
+- ``defect_weld_line``  — regression  (``y_burden_weld_line``, float 0–1)
 
 Usage::
 
@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from .training_row_loader import (
     align_to_union_schema,
+    extract_control_families,
     extract_parameter_schema,
     extract_targets,
     filter_eligible,
@@ -39,12 +40,12 @@ from .training_row_loader import (
 # Constants
 # ---------------------------------------------------------------------------
 
-SUGGESTION_TARGETS: Dict[str, Tuple[Literal["regression", "classification"], str]] = {
-    "quality_score":    ("regression",     "y_quality_score"),
-    "defect_burn_mark": ("classification", "y_defect_burn_mark"),
-    "defect_flash":     ("classification", "y_defect_flash"),
-    "defect_sink_mark": ("classification", "y_defect_sink_mark"),
-    "defect_weld_line": ("classification", "y_defect_weld_line"),
+SUGGESTION_TARGETS: Dict[str, Tuple[Literal["regression", "classification"], str, str]] = {
+    "quality_score":    ("regression", "y_quality_score", "quality_score"),
+    "defect_burn_mark": ("regression", "y_burden_burn_mark", "defect_burden"),
+    "defect_flash":     ("regression", "y_burden_flash", "defect_burden"),
+    "defect_sink_mark": ("regression", "y_burden_sink_mark", "defect_burden"),
+    "defect_weld_line": ("regression", "y_burden_weld_line", "defect_burden"),
 }
 
 
@@ -79,6 +80,8 @@ class GbtTrainingConfig:
 class TargetResult:
     target_name: str
     model_type: Literal["regression", "classification"]
+    source_target: str
+    signal_kind: str
     model: Any                      # fitted LightGBM model
     feature_keys: List[str]
     used_feature_keys: List[str]
@@ -94,6 +97,9 @@ class TrainResult:
     feature_keys: List[str]
     imputation_values: Dict[str, float]  # fallback values for legacy/runtime compatibility
     parameter_schema: List[Dict[str, Any]]
+    control_families: List[Dict[str, Any]]
+    deployable_control_families: List[Dict[str, Any]]
+    control_family_validation: List[Dict[str, Any]]
     targets: Dict[str, TargetResult]
     null_strategy: Literal["native_missing", "mean_impute", "zero_impute"]
     n_eligible_rows: int
@@ -254,6 +260,11 @@ def _selected_feature_keys(
     return filtered or list(feature_keys)
 
 
+def _target_has_variation(values: Sequence[float]) -> bool:
+    observed = {float(value) for value in values}
+    return len(observed) > 1
+
+
 def _annotate_trained_control_keys(
     parameter_schema: Sequence[Dict[str, Any]],
     trained_feature_keys: Sequence[str],
@@ -275,6 +286,89 @@ def _annotate_trained_control_keys(
         ]
         annotated.append(annotated_item)
     return annotated
+
+
+def _annotate_control_families(
+    control_families: Sequence[Dict[str, Any]],
+    trained_feature_keys: Sequence[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    trained_set = {str(key) for key in trained_feature_keys}
+    annotated: List[Dict[str, Any]] = []
+    deployable: List[Dict[str, Any]] = []
+    validation: List[Dict[str, Any]] = []
+
+    for family in control_families:
+        if not isinstance(family, dict):
+            continue
+        family_id = str(family.get("family_id") or "").strip()
+        if not family_id:
+            continue
+        members_raw = family.get("ordered_members") or []
+        if not isinstance(members_raw, list):
+            members_raw = []
+        family_type = str(family.get("family_type") or "").strip() or (
+            "atomic" if len(members_raw) > 1 else "single_slot"
+        )
+        members: List[Dict[str, Any]] = []
+        trained_member_parameter_ids: List[str] = []
+        dropped_member_parameter_ids: List[str] = []
+
+        for member in members_raw:
+            if not isinstance(member, dict):
+                continue
+            parameter_id = str(member.get("parameter_id") or "").strip()
+            if not parameter_id:
+                continue
+            control_feature_keys = [
+                str(key)
+                for key in member.get("control_feature_keys", ())
+                if str(key).strip()
+            ]
+            trained_control_feature_keys = [
+                key for key in control_feature_keys if key in trained_set
+            ]
+            if trained_control_feature_keys:
+                trained_member_parameter_ids.append(parameter_id)
+            elif control_feature_keys:
+                dropped_member_parameter_ids.append(parameter_id)
+            member_item = dict(member)
+            member_item["control_feature_keys"] = control_feature_keys
+            member_item["trained_control_feature_keys"] = trained_control_feature_keys
+            members.append(member_item)
+
+        if family_type == "atomic":
+            is_deployable = bool(members) and not dropped_member_parameter_ids and bool(trained_member_parameter_ids)
+            reason = "ok" if is_deployable else (
+                "atomic_member_missing_trained_feature"
+                if dropped_member_parameter_ids
+                else "no_trained_members"
+            )
+        else:
+            is_deployable = bool(trained_member_parameter_ids)
+            reason = "ok" if is_deployable else "no_trained_members"
+
+        family_item = dict(family)
+        family_item["family_type"] = family_type
+        family_item["ordered_members"] = members
+        family_item["trained_member_parameter_ids"] = trained_member_parameter_ids
+        family_item["dropped_member_parameter_ids"] = dropped_member_parameter_ids
+        family_item["deployable"] = is_deployable
+        family_item["deployability_reason"] = reason
+        annotated.append(family_item)
+        validation.append(
+            {
+                "family_id": family_id,
+                "family_type": family_type,
+                "deployable": is_deployable,
+                "reason": reason,
+                "trained_member_parameter_ids": list(trained_member_parameter_ids),
+                "dropped_member_parameter_ids": list(dropped_member_parameter_ids),
+            }
+        )
+        if is_deployable:
+            deployable.append(family_item)
+
+    return annotated, deployable, validation
 
 
 def _effective_min_child_samples(configured: int, n_rows: int) -> int:
@@ -420,6 +514,10 @@ def train_suggestion_models(
         extract_parameter_schema(eligible),
         feature_keys,
     )
+    control_families, deployable_control_families, control_family_validation = _annotate_control_families(
+        extract_control_families(eligible),
+        feature_keys,
+    )
 
     # Compute fallback values from training data for legacy/runtime compatibility.
     fill_values = _compute_means(raw_matrix, feature_keys)
@@ -434,7 +532,7 @@ def train_suggestion_models(
 
     target_results: Dict[str, TargetResult] = {}
 
-    for target_name, (model_type, jsonl_key) in SUGGESTION_TARGETS.items():
+    for target_name, (model_type, jsonl_key, signal_kind) in SUGGESTION_TARGETS.items():
         raw_y = extract_targets(eligible, jsonl_key)
 
         # Filter rows where target is present.
@@ -444,6 +542,11 @@ def train_suggestion_models(
 
         if len(y_valid) < config.min_rows:
             # Not enough data for this target — skip silently with NaN metric.
+            continue
+
+        if not _target_has_variation(y_valid):
+            # Constant targets do not add useful signal and only create
+            # degenerate models / misleading perfect metrics in reports.
             continue
 
         if model_type == "regression":
@@ -506,6 +609,8 @@ def train_suggestion_models(
         target_results[target_name] = TargetResult(
             target_name=target_name,
             model_type=model_type,
+            source_target=jsonl_key,
+            signal_kind=signal_kind,
             model=model,
             feature_keys=feature_keys,
             used_feature_keys=used_feature_keys,
@@ -526,6 +631,9 @@ def train_suggestion_models(
         feature_keys=feature_keys,
         imputation_values=fill_values,
         parameter_schema=parameter_schema,
+        control_families=control_families,
+        deployable_control_families=deployable_control_families,
+        control_family_validation=control_family_validation,
         targets=target_results,
         null_strategy=config.null_strategy,
         n_eligible_rows=len(eligible),

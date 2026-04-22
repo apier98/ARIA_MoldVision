@@ -48,6 +48,10 @@ def _make_row(
             "y_defect_sink_mark": defect_sink_mark,
             "y_defect_burn_mark": defect_burn_mark,
             "y_defect_weld_line": defect_weld_line,
+            "y_burden_flash": 0.6 if defect_flash else 0.0,
+            "y_burden_sink_mark": 0.6 if defect_sink_mark else 0.0,
+            "y_burden_burn_mark": 0.6 if defect_burn_mark else 0.0,
+            "y_burden_weld_line": 0.6 if defect_weld_line else 0.0,
         },
         "context": {
             "defect_classes_monitored": ["flash", "sink_mark", "burn_mark", "weld_line"],
@@ -59,6 +63,7 @@ def _make_row(
             "parameter_schema": [
                 {
                     "parameter_id": "temp_barrel",
+                    "family_id": "temp_barrel",
                     "display_name": "Barrel Temperature",
                     "unit": "C",
                     "baseline": 220.0,
@@ -128,6 +133,30 @@ class TestGbtTrainer(unittest.TestCase):
         from moldvision.predictive.trainer import train_suggestion_models
         result = train_suggestion_models(self.rows, config=self.config)
         self.assertIn("quality_score", result.targets)
+
+    def test_defect_targets_use_regression_burden_signals(self) -> None:
+        from moldvision.predictive.trainer import train_suggestion_models
+
+        result = train_suggestion_models(self.rows, config=self.config)
+
+        defect_target = result.targets["defect_flash"]
+        self.assertEqual(defect_target.model_type, "regression")
+        self.assertEqual(defect_target.source_target, "y_burden_flash")
+        self.assertEqual(defect_target.signal_kind, "defect_burden")
+        self.assertEqual(defect_target.cv_metric_name, "rmse")
+
+    def test_constant_regression_target_is_skipped(self) -> None:
+        from moldvision.predictive.trainer import train_suggestion_models
+
+        rows = _make_rows(30)
+        for row in rows:
+            row["targets"]["y_burden_flash"] = 0.0
+
+        result = train_suggestion_models(rows, config=self.config)
+
+        self.assertIn("quality_score", result.targets)
+        self.assertNotIn("defect_flash", result.targets)
+        self.assertIn("defect_sink_mark", result.targets)
 
     def test_cv_metric_values_finite(self) -> None:
         from moldvision.predictive.trainer import train_suggestion_models
@@ -221,6 +250,10 @@ class TestGbtTrainer(unittest.TestCase):
                         "y_defect_sink_mark": 0,
                         "y_defect_burn_mark": 0,
                         "y_defect_weld_line": 0,
+                        "y_burden_flash": 0.6 if i % 3 == 0 else 0.0,
+                        "y_burden_sink_mark": 0.0,
+                        "y_burden_burn_mark": 0.0,
+                        "y_burden_weld_line": 0.0,
                     },
                     "context": {
                         "defect_classes_monitored": ["flash"],
@@ -299,6 +332,10 @@ class TestGbtTrainer(unittest.TestCase):
                         "y_defect_sink_mark": 0,
                         "y_defect_burn_mark": 0,
                         "y_defect_weld_line": 0,
+                        "y_burden_flash": 0.6 if i % 3 == 0 else 0.0,
+                        "y_burden_sink_mark": 0.0,
+                        "y_burden_burn_mark": 0.0,
+                        "y_burden_weld_line": 0.0,
                     },
                     "context": {
                         "defect_classes_monitored": ["flash"],
@@ -309,6 +346,7 @@ class TestGbtTrainer(unittest.TestCase):
                         "parameter_schema": [
                             {
                                 "parameter_id": "pressure_injection:step_1",
+                                "family_id": "pressure_injection",
                                 "display_name": "Injection Pressure - Step 1",
                                 "unit": "bar",
                                 "baseline": 800.0,
@@ -320,6 +358,7 @@ class TestGbtTrainer(unittest.TestCase):
                             },
                             {
                                 "parameter_id": "temp_barrel:zone_1",
+                                "family_id": "temp_barrel",
                                 "display_name": "Barrel Zone 1",
                                 "unit": "C",
                                 "baseline": 220.0,
@@ -346,6 +385,98 @@ class TestGbtTrainer(unittest.TestCase):
             schema_by_id["temp_barrel:zone_1"]["trained_control_feature_keys"],
             [],
         )
+
+    def test_atomic_control_family_not_marked_deployable_when_member_is_pruned(self) -> None:
+        from moldvision.predictive.trainer import GbtTrainingConfig, train_suggestion_models
+
+        rows = []
+        for i in range(12):
+            rows.append(
+                {
+                    "schema_version": "training_row_v2",
+                    "session_id": f"sess_atomic_{i:03d}",
+                    "component_id": f"cmp_atomic_{i:03d}",
+                    "eligibility": {
+                        "training_ready": True,
+                        "base_quality_gate_ready": True,
+                        "coverage_ratio": 0.95,
+                    },
+                    "features": {
+                        "pressure_injection:step_1.setpoint_end": 800.0 + i,
+                        "pressure_injection:step_2.setpoint_end": 700.0,
+                    },
+                    "targets": {
+                        "y_quality_score": 0.6 + i * 0.01,
+                        "y_defect_flash": int(i % 3 == 0),
+                        "y_defect_sink_mark": 0,
+                        "y_defect_burn_mark": 0,
+                        "y_defect_weld_line": 0,
+                        "y_burden_flash": 0.6 if i % 3 == 0 else 0.0,
+                        "y_burden_sink_mark": 0.0,
+                        "y_burden_burn_mark": 0.0,
+                        "y_burden_weld_line": 0.0,
+                    },
+                    "context": {
+                        "defect_classes_monitored": ["flash"],
+                        "feature_keys": [
+                            "pressure_injection:step_1.setpoint_end",
+                            "pressure_injection:step_2.setpoint_end",
+                        ],
+                        "parameter_schema": [
+                            {
+                                "parameter_id": "pressure_injection:step_1",
+                                "family_id": "pressure_injection",
+                                "canonical_parameter_id": "pressure_injection",
+                                "canonical_slot_id": "step_1",
+                                "display_name": "Injection Pressure - Step 1",
+                                "unit": "bar",
+                                "baseline": 800.0,
+                                "range_min": 500.0,
+                                "range_max": 1200.0,
+                                "control_feature_keys": ["pressure_injection:step_1.setpoint_end"],
+                            },
+                            {
+                                "parameter_id": "pressure_injection:step_2",
+                                "family_id": "pressure_injection",
+                                "canonical_parameter_id": "pressure_injection",
+                                "canonical_slot_id": "step_2",
+                                "display_name": "Injection Pressure - Step 2",
+                                "unit": "bar",
+                                "baseline": 700.0,
+                                "range_min": 500.0,
+                                "range_max": 1200.0,
+                                "control_feature_keys": ["pressure_injection:step_2.setpoint_end"],
+                            },
+                        ],
+                        "control_families": [
+                            {
+                                "family_id": "pressure_injection",
+                                "family_type": "atomic",
+                                "ordered_members": [
+                                    {
+                                        "parameter_id": "pressure_injection:step_1",
+                                        "canonical_slot_id": "step_1",
+                                        "control_feature_keys": ["pressure_injection:step_1.setpoint_end"],
+                                    },
+                                    {
+                                        "parameter_id": "pressure_injection:step_2",
+                                        "canonical_slot_id": "step_2",
+                                        "control_feature_keys": ["pressure_injection:step_2.setpoint_end"],
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                }
+            )
+
+        result = train_suggestion_models(rows, config=GbtTrainingConfig(n_estimators=5, cv_folds=2, min_rows=5))
+
+        self.assertEqual(result.feature_keys, ["pressure_injection:step_1.setpoint_end"])
+        self.assertEqual(len(result.control_families), 1)
+        self.assertEqual(result.control_families[0]["deployable"], False)
+        self.assertEqual(result.control_families[0]["deployability_reason"], "atomic_member_missing_trained_feature")
+        self.assertEqual(result.deployable_control_families, [])
 
 
 @unittest.skipUnless(_PREDICTIVE_AVAILABLE, "lightgbm / scikit-learn not installed")

@@ -40,6 +40,10 @@ def _make_row(session_id: str, i: int) -> dict:
             "y_defect_sink_mark": int(i % 4 == 0),
             "y_defect_burn_mark": int(i % 5 == 0),
             "y_defect_weld_line": int(i % 6 == 0),
+            "y_burden_flash": 0.6 if i % 3 == 0 else 0.0,
+            "y_burden_sink_mark": 0.6 if i % 4 == 0 else 0.0,
+            "y_burden_burn_mark": 0.6 if i % 5 == 0 else 0.0,
+            "y_burden_weld_line": 0.6 if i % 6 == 0 else 0.0,
         },
         "context": {
             "defect_classes_monitored": ["flash", "sink_mark"],
@@ -47,6 +51,7 @@ def _make_row(session_id: str, i: int) -> dict:
             "parameter_schema": [
                 {
                     "parameter_id": "temp_barrel",
+                    "family_id": "temp_barrel",
                     "display_name": "Barrel Temperature",
                     "unit": "C",
                     "baseline": 220.0,
@@ -71,6 +76,15 @@ class TestWriteSuggestionBundle(unittest.TestCase):
     def _train(self, n: int = 30):
         from moldvision.predictive.trainer import GbtTrainingConfig, train_suggestion_models
         rows = [_make_row(f"sess_{i:03d}", i) for i in range(n)]
+        cfg = GbtTrainingConfig(n_estimators=5, cv_folds=2, min_rows=5)
+        return train_suggestion_models(rows, config=cfg)
+
+    def _train_with_constant_flash_burden(self, n: int = 30):
+        from moldvision.predictive.trainer import GbtTrainingConfig, train_suggestion_models
+
+        rows = [_make_row(f"sess_{i:03d}", i) for i in range(n)]
+        for row in rows:
+            row["targets"]["y_burden_flash"] = 0.0
         cfg = GbtTrainingConfig(n_estimators=5, cv_folds=2, min_rows=5)
         return train_suggestion_models(rows, config=cfg)
 
@@ -112,6 +126,7 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             )
             manifest = json.loads((bundle_dir / "manifest.json").read_text())
             self.assertEqual(manifest["feature_keys"], result.feature_keys)
+            self.assertEqual(manifest["trained_feature_keys"], result.feature_keys)
 
     def test_manifest_parameter_schema_match(self) -> None:
         from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
@@ -122,6 +137,8 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             )
             manifest = json.loads((bundle_dir / "manifest.json").read_text())
             self.assertEqual(manifest["parameter_schema"], result.parameter_schema)
+            self.assertEqual(manifest["control_families"], result.control_families)
+            self.assertEqual(manifest["deployable_control_families"], result.deployable_control_families)
 
     def test_onnx_files_present(self) -> None:
         from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
@@ -131,7 +148,8 @@ class TestWriteSuggestionBundle(unittest.TestCase):
                 Path(td), result, model_name="startup-suggestion", model_version="0.0.1"
             )
             manifest = json.loads((bundle_dir / "manifest.json").read_text())
-            for filename in manifest["target_models"].values():
+            for spec in manifest["target_models"].values():
+                filename = spec["filename"]
                 self.assertTrue(
                     (bundle_dir / filename).exists(),
                     f"ONNX file missing: {filename}",
@@ -166,7 +184,11 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             self.assertEqual(meta["selected_feature_stats"], ["setpoint_end", "present"])
             self.assertIn("min_feature_presence_ratio", meta["lgbm_config"])
             self.assertEqual(meta["selected_feature_keys"], result.feature_keys)
+            self.assertEqual(meta["trained_feature_keys"], result.feature_keys)
             self.assertIn("used_feature_keys", meta["cv_metrics"]["quality_score"])
+            self.assertEqual(meta["cv_metrics"]["defect_flash"]["model_type"], "regression")
+            self.assertEqual(meta["cv_metrics"]["defect_flash"]["source_target"], "y_burden_flash")
+            self.assertEqual(meta["control_family_validation"], result.control_family_validation)
 
     def test_manifest_records_selected_feature_stats(self) -> None:
         from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
@@ -177,6 +199,34 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             )
             manifest = json.loads((bundle_dir / "manifest.json").read_text())
             self.assertEqual(manifest["selected_feature_stats"], ["setpoint_end", "present"])
+
+    def test_manifest_target_models_include_target_metadata(self) -> None:
+        from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
+
+        result = self._train()
+        with tempfile.TemporaryDirectory() as td:
+            bundle_dir = write_suggestion_bundle(
+                Path(td), result, model_name="startup-suggestion", model_version="0.0.1"
+            )
+            manifest = json.loads((bundle_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 3)
+            self.assertEqual(manifest["target_models"]["quality_score"]["model_type"], "regression")
+            self.assertEqual(manifest["target_models"]["quality_score"]["source_target"], "y_quality_score")
+            self.assertEqual(manifest["target_models"]["defect_flash"]["model_type"], "regression")
+            self.assertEqual(manifest["target_models"]["defect_flash"]["signal_kind"], "defect_burden")
+
+    def test_bundle_omits_constant_targets(self) -> None:
+        from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
+
+        result = self._train_with_constant_flash_burden()
+        with tempfile.TemporaryDirectory() as td:
+            bundle_dir = write_suggestion_bundle(
+                Path(td), result, model_name="startup-suggestion", model_version="0.0.1"
+            )
+            manifest = json.loads((bundle_dir / "manifest.json").read_text())
+            meta = json.loads((bundle_dir / "training_meta.json").read_text())
+            self.assertNotIn("defect_flash", manifest["target_models"])
+            self.assertNotIn("defect_flash", meta["cv_metrics"])
 
     def test_pack_sugbundle_creates_zip(self) -> None:
         from moldvision.predictive.suggestion_bundle import pack_sugbundle, write_suggestion_bundle

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -276,6 +277,7 @@ def extract_parameter_schema(
             if entry is None:
                 entry = {
                     "parameter_id": parameter_id,
+                    "family_id": str(item.get("family_id", "")).strip() or None,
                     "raw_parameter_id": str(item.get("raw_parameter_id", "")).strip() or None,
                     "parameter_id_base": str(item.get("parameter_id_base", "")).strip() or None,
                     "page_id": str(item.get("page_id", "")).strip() or None,
@@ -299,6 +301,7 @@ def extract_parameter_schema(
                 if key not in entry["control_feature_keys"]:
                     entry["control_feature_keys"].append(key)
             for field_name in (
+                "family_id",
                 "raw_parameter_id",
                 "parameter_id_base",
                 "page_id",
@@ -329,39 +332,280 @@ def extract_parameter_schema(
     return [merged[key] for key in sorted(merged)]
 
 
-def check_schema_homogeneity(rows: Sequence[dict]) -> Dict[str, Any]:
-    """Check whether all rows share the same HMI schema.
+def _slot_sort_key(token: str | None) -> tuple:
+    raw = str(token or "").strip().lower()
+    if not raw:
+        return ("",)
+    parts = re.split(r"(\d+)", raw)
+    key: list[object] = []
+    for part in parts:
+        if not part:
+            continue
+        key.append(int(part) if part.isdigit() else part)
+    return tuple(key)
 
-    Returns a dict with ``homogeneous`` (bool), ``n_schemas``, and per-layout
-    details.  Mirrors the ``schema_homogeneous`` logic in MoldTrace's
-    ``export_training_rows`` summary.
+
+def _fallback_control_families_from_schema(schema: Sequence[dict]) -> List[dict]:
+    grouped: Dict[str, dict] = {}
+    for item in schema:
+        if not isinstance(item, dict):
+            continue
+        parameter_id = str(item.get("parameter_id") or "").strip()
+        if not parameter_id:
+            continue
+        family_id = (
+            str(item.get("family_id") or "").strip()
+            or str(item.get("canonical_parameter_id") or "").strip()
+            or str(item.get("parameter_id_base") or "").strip()
+            or parameter_id.split(":", 1)[0]
+        )
+        family = grouped.get(family_id)
+        if family is None:
+            family = {
+                "family_id": family_id,
+                "display_name": str(item.get("display_name") or family_id).strip() or family_id,
+                "page_id": str(item.get("page_id") or "").strip() or None,
+                "subpage_id": str(item.get("subpage_id") or "").strip() or None,
+                "family_constraints": {"ordered_slots": True, "dynamic_activation": True},
+                "ordered_members": [],
+            }
+            grouped[family_id] = family
+        family["ordered_members"].append(
+            {
+                "parameter_id": parameter_id,
+                "slot_id": str(item.get("slot_id") or "").strip() or None,
+                "canonical_slot_id": str(item.get("canonical_slot_id") or "").strip() or None,
+                "display_name": str(item.get("display_name") or parameter_id).strip() or parameter_id,
+                "control_feature_keys": [
+                    str(key) for key in item.get("control_feature_keys", ()) if str(key).strip()
+                ],
+                "activation_state": "unknown",
+                "observability_state": "unknown",
+            }
+        )
+    out: List[dict] = []
+    for family_id in sorted(grouped):
+        family = grouped[family_id]
+        members = sorted(
+            family["ordered_members"],
+            key=lambda item: _slot_sort_key(item.get("canonical_slot_id") or item.get("slot_id")),
+        )
+        out.append(
+            {
+                "family_id": family_id,
+                "display_name": family["display_name"],
+                "page_id": family["page_id"],
+                "subpage_id": family["subpage_id"],
+                "family_type": "atomic" if len(members) > 1 else "single_slot",
+                "activation_state": "unknown",
+                "observability_state": "unknown",
+                "activation_mask": [0 for _ in members],
+                "family_constraints": family["family_constraints"],
+                "ordered_members": members,
+            }
+        )
+    return out
+
+
+def extract_control_families(rows: Sequence[dict]) -> List[dict]:
+    """Merge control-family metadata from training rows.
+
+    Prefers ``context.control_families`` when present and falls back to deriving
+    grouped families from ``context.parameter_schema`` for older datasets.
     """
-    seen_sets: dict[tuple, int] = {}
+    merged: Dict[str, dict] = {}
+
+    for row in rows:
+        ctx = row.get("context") or {}
+        raw_families = ctx.get("control_families")
+        if not isinstance(raw_families, list) or not raw_families:
+            raw_families = _fallback_control_families_from_schema(ctx.get("parameter_schema") or [])
+        for family in raw_families:
+            if not isinstance(family, dict):
+                continue
+            family_id = str(family.get("family_id") or "").strip()
+            if not family_id:
+                continue
+            entry = merged.get(family_id)
+            if entry is None:
+                entry = {
+                    "family_id": family_id,
+                    "display_name": str(family.get("display_name") or family_id).strip() or family_id,
+                    "page_id": str(family.get("page_id") or "").strip() or None,
+                    "subpage_id": str(family.get("subpage_id") or "").strip() or None,
+                    "family_type": str(family.get("family_type") or "").strip() or None,
+                    "family_constraints": dict(family.get("family_constraints") or {}),
+                    "observed_activation_states": set(),
+                    "observed_observability_states": set(),
+                    "members_by_id": {},
+                }
+                merged[family_id] = entry
+            if not entry["display_name"] and family.get("display_name"):
+                entry["display_name"] = str(family.get("display_name")).strip() or family_id
+            if entry["page_id"] is None and family.get("page_id") not in (None, ""):
+                entry["page_id"] = str(family.get("page_id")).strip() or None
+            if entry["subpage_id"] is None and family.get("subpage_id") not in (None, ""):
+                entry["subpage_id"] = str(family.get("subpage_id")).strip() or None
+            if entry["family_type"] is None and family.get("family_type") not in (None, ""):
+                entry["family_type"] = str(family.get("family_type")).strip() or None
+            entry["family_constraints"].update(dict(family.get("family_constraints") or {}))
+            if family.get("activation_state"):
+                entry["observed_activation_states"].add(str(family.get("activation_state")))
+            if family.get("observability_state"):
+                entry["observed_observability_states"].add(str(family.get("observability_state")))
+
+            members = family.get("ordered_members") or []
+            if not isinstance(members, list):
+                continue
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                parameter_id = str(member.get("parameter_id") or "").strip()
+                if not parameter_id:
+                    continue
+                member_entry = entry["members_by_id"].get(parameter_id)
+                if member_entry is None:
+                    member_entry = {
+                        "parameter_id": parameter_id,
+                        "slot_id": str(member.get("slot_id") or "").strip() or None,
+                        "canonical_slot_id": str(member.get("canonical_slot_id") or "").strip() or None,
+                        "display_name": str(member.get("display_name") or parameter_id).strip() or parameter_id,
+                        "control_feature_keys": [],
+                        "observed_activation_states": set(),
+                        "observed_observability_states": set(),
+                    }
+                    entry["members_by_id"][parameter_id] = member_entry
+                for key in member.get("control_feature_keys", ()):
+                    token = str(key).strip()
+                    if token and token not in member_entry["control_feature_keys"]:
+                        member_entry["control_feature_keys"].append(token)
+                if member_entry["slot_id"] is None and member.get("slot_id") not in (None, ""):
+                    member_entry["slot_id"] = str(member.get("slot_id")).strip() or None
+                if member_entry["canonical_slot_id"] is None and member.get("canonical_slot_id") not in (None, ""):
+                    member_entry["canonical_slot_id"] = str(member.get("canonical_slot_id")).strip() or None
+                if member_entry["display_name"] == parameter_id and member.get("display_name"):
+                    member_entry["display_name"] = str(member.get("display_name")).strip() or parameter_id
+                if member.get("activation_state"):
+                    member_entry["observed_activation_states"].add(str(member.get("activation_state")))
+                if member.get("observability_state"):
+                    member_entry["observed_observability_states"].add(str(member.get("observability_state")))
+
+    out: List[dict] = []
+    for family_id in sorted(merged):
+        entry = merged[family_id]
+        members = sorted(
+            entry["members_by_id"].values(),
+            key=lambda item: _slot_sort_key(item.get("canonical_slot_id") or item.get("slot_id")),
+        )
+        family_type = entry["family_type"] or ("atomic" if len(members) > 1 else "single_slot")
+        out.append(
+            {
+                "family_id": family_id,
+                "display_name": entry["display_name"],
+                "page_id": entry["page_id"],
+                "subpage_id": entry["subpage_id"],
+                "family_type": family_type,
+                "family_constraints": entry["family_constraints"],
+                "observed_activation_states": sorted(entry["observed_activation_states"]),
+                "observed_observability_states": sorted(entry["observed_observability_states"]),
+                "ordered_members": [
+                    {
+                        "parameter_id": member["parameter_id"],
+                        "slot_id": member["slot_id"],
+                        "canonical_slot_id": member["canonical_slot_id"],
+                        "display_name": member["display_name"],
+                        "control_feature_keys": list(member["control_feature_keys"]),
+                        "observed_activation_states": sorted(member["observed_activation_states"]),
+                        "observed_observability_states": sorted(member["observed_observability_states"]),
+                    }
+                    for member in members
+                ],
+            }
+        )
+    return out
+
+
+def check_schema_homogeneity(rows: Sequence[dict]) -> Dict[str, Any]:
+    """Check whether all rows share the same layout contract.
+
+    Separates stable layout identity from exact feature-key equality so streamed
+    slot activation does not look like a cross-layout schema mismatch.
+    """
+    layout_signatures: dict[tuple, int] = {}
+    feature_set_signatures: dict[tuple, int] = {}
+    activation_profile_signatures: dict[tuple, int] = {}
     layouts: List[dict] = []
     for row in rows:
         ctx = row.get("context") or {}
         layout_id = str(ctx.get("hmi_layout_id") or "").strip()
+        layout_version = str(ctx.get("hmi_layout_version") or "").strip()
         machine_family = str(ctx.get("machine_family") or "").strip()
-        if layout_id or machine_family:
-            fs = ("layout", layout_id or None, machine_family or None)
+        feature_keys = ctx.get("feature_keys")
+        if layout_id or layout_version or machine_family:
+            layout_signature = (
+                "layout",
+                layout_id or None,
+                layout_version or None,
+                machine_family or None,
+            )
         else:
-            fk = ctx.get("feature_keys")
-            if isinstance(fk, list):
-                fs = ("feature-set", frozenset(str(key) for key in fk))
+            if isinstance(feature_keys, list):
+                layout_signature = ("feature-set-fallback", tuple(sorted(str(key) for key in feature_keys)))
             else:
-                fs = ("feature-set", frozenset((row.get("features") or {}).keys()))
-        seen_sets[fs] = seen_sets.get(fs, 0) + 1
+                layout_signature = ("feature-set-fallback", tuple(sorted((row.get("features") or {}).keys())))
+        layout_signatures[layout_signature] = layout_signatures.get(layout_signature, 0) + 1
+
+        if isinstance(feature_keys, list):
+            feature_signature = tuple(sorted(str(key) for key in feature_keys))
+        else:
+            feature_signature = tuple(sorted((row.get("features") or {}).keys()))
+        feature_set_signatures[feature_signature] = feature_set_signatures.get(feature_signature, 0) + 1
+
+        activation_signature = tuple(
+            sorted(
+                (
+                    str(family.get("family_id") or ""),
+                    tuple(int(value) for value in (family.get("activation_mask") or [])),
+                )
+                for family in (ctx.get("control_families") or [])
+                if isinstance(family, dict)
+            )
+        )
+        activation_profile_signatures[activation_signature] = (
+            activation_profile_signatures.get(activation_signature, 0) + 1
+        )
+
         layout_entry = {
             "hmi_layout_id": ctx.get("hmi_layout_id"),
+            "hmi_layout_version": ctx.get("hmi_layout_version"),
             "machine_family": ctx.get("machine_family"),
         }
         if layout_entry not in layouts:
             layouts.append(layout_entry)
+    layout_homogeneous = len(layout_signatures) <= 1
+    feature_set_homogeneous = len(feature_set_signatures) <= 1
     return {
-        "homogeneous": len(seen_sets) <= 1,
-        "n_schemas": len(seen_sets),
+        "homogeneous": layout_homogeneous,
+        "schema_homogeneous": layout_homogeneous,
+        "layout_homogeneous": layout_homogeneous,
+        "feature_set_homogeneous": feature_set_homogeneous,
+        "dynamic_feature_variation": layout_homogeneous and not feature_set_homogeneous,
+        "family_activation_diverse": len(activation_profile_signatures) > 1,
+        "n_schemas": len(layout_signatures),
+        "n_layout_schemas": len(layout_signatures),
+        "n_feature_sets": len(feature_set_signatures),
+        "n_activation_profiles": len(activation_profile_signatures),
         "rows_per_schema": dict(
-            (repr(fs)[:80], cnt) for fs, cnt in seen_sets.items()
+            (repr(fs)[:120], cnt) for fs, cnt in layout_signatures.items()
+        ),
+        "rows_per_layout_schema": dict(
+            (repr(fs)[:120], cnt) for fs, cnt in layout_signatures.items()
+        ),
+        "rows_per_feature_set": dict(
+            (repr(fs[:5])[:120], cnt) for fs, cnt in feature_set_signatures.items()
+        ),
+        "rows_per_activation_profile": dict(
+            (repr(fs)[:120], cnt) for fs, cnt in activation_profile_signatures.items()
         ),
         "hmi_layouts_seen": layouts,
     }
@@ -453,6 +697,11 @@ def summarize_dataset(rows: Sequence[dict]) -> Dict[str, Any]:
         "feature_columns": len(feature_keys),
         "schema_homogeneous": homogeneity["homogeneous"],
         "n_schemas": homogeneity["n_schemas"],
+        "layout_homogeneous": homogeneity["layout_homogeneous"],
+        "feature_set_homogeneous": homogeneity["feature_set_homogeneous"],
+        "dynamic_feature_variation": homogeneity["dynamic_feature_variation"],
+        "family_activation_diverse": homogeneity["family_activation_diverse"],
+        "n_feature_sets": homogeneity["n_feature_sets"],
         "hmi_layouts_seen": homogeneity["hmi_layouts_seen"],
         "quality_score_stats": {
             "count": len(quality_scores),

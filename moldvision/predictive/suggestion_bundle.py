@@ -2,9 +2,9 @@
 
 A ``.sugbundle`` is a renamed ``.zip`` file containing:
 
-- ``manifest.json``             — identity, feature schema, target models map, checksums
+- ``manifest.json``             — identity, feature schema, target model metadata, checksums
 - ``model_quality_score.onnx``  — LightGBM regression → float quality score
-- ``model_defect_*.onnx``       — LightGBM binary classifiers → defect risk probabilities
+- ``model_defect_*.onnx``       — LightGBM regression → continuous per-defect burden signals
 - ``training_meta.json``        — provenance (n_rows, CV metrics, date, dataset source)
 
 The bundle is consumed by MoldPilot's ``SuggestionBundleReader`` which uses the
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .trainer import SUGGESTION_TARGETS, TrainResult, export_target_to_onnx
+from .trainer import TrainResult, export_target_to_onnx
 
 # Default quality weights (must match §8.3.1 of ARIA_System_Integration.md).
 DEFAULT_QUALITY_WEIGHTS: Dict[str, float] = {
@@ -41,7 +41,7 @@ DEFAULT_QUALITY_WEIGHTS: Dict[str, float] = {
     "weld_line": 0.15,
 }
 
-BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -129,16 +129,24 @@ def write_suggestion_bundle(
     weights = quality_weights or DEFAULT_QUALITY_WEIGHTS
 
     # Export each trained target to ONNX.
-    target_models: Dict[str, str] = {}
+    target_models: Dict[str, dict] = {}
     for target_name, target_result in train_result.targets.items():
         onnx_filename = f"model_{target_name}.onnx"
         onnx_bytes = export_target_to_onnx(target_result)
         (bundle_dir / onnx_filename).write_bytes(onnx_bytes)
-        target_models[target_name] = onnx_filename
+        target_models[target_name] = {
+            "filename": onnx_filename,
+            "model_type": target_result.model_type,
+            "source_target": target_result.source_target,
+            "signal_kind": target_result.signal_kind,
+        }
 
     # Write training metadata.
     cv_metrics = {
         name: {
+            "model_type": r.model_type,
+            "source_target": r.source_target,
+            "signal_kind": r.signal_kind,
             "metric": r.cv_metric_name,
             "mean": round(r.cv_metric_value, 6),
             "std": round(r.cv_metric_std, 6),
@@ -152,8 +160,10 @@ def write_suggestion_bundle(
         "n_eligible_rows": train_result.n_eligible_rows,
         "n_features": len(train_result.feature_keys),
         "selected_feature_keys": list(train_result.feature_keys),
+        "trained_feature_keys": list(train_result.feature_keys),
         "null_strategy": train_result.null_strategy,
         "selected_feature_stats": list(train_result.config.selected_feature_stats),
+        "control_family_validation": list(train_result.control_family_validation),
         "cv_metrics": cv_metrics,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_source": dataset_source,
@@ -180,7 +190,10 @@ def write_suggestion_bundle(
         "min_app_version": min_app_version,
         "created_at":      datetime.now(timezone.utc).isoformat(),
         "feature_keys":    train_result.feature_keys,
+        "trained_feature_keys": list(train_result.feature_keys),
         "parameter_schema": train_result.parameter_schema,
+        "control_families": train_result.control_families,
+        "deployable_control_families": train_result.deployable_control_families,
         "imputation_values": {
             k: round(v, 8) for k, v in train_result.imputation_values.items()
         },

@@ -12,7 +12,7 @@ Integrated system for computer-vision defect detection and predictive startup-su
 - Subsample COCO splits (stratified by class + proportional background)
 - Normalize COCO category ids to contiguous `0..N-1` (fixes common training issues)
 - Train defect detection models (detect or seg)
-- Train predictive startup-suggestion models from MoldTrace `training_row_v1` JSONL exports
+- Train predictive startup-suggestion models from MoldTrace `training_row_v2` JSONL exports (legacy `training_row_v1` still loads for backward compatibility)
 - List shared MoldTrace predictive-training exports from `shared\ingest\moldtrace\training_rows\v1\...`
 - Export trained models to ONNX (and optionally build TensorRT engines)
 - Create deployment bundles compatible with ARIA MoldPilot (`.mpk` format, versioned, checksummed)
@@ -55,7 +55,7 @@ pip install "aria-moldvision[label-studio]"
 
 ## Configuration
 
-MoldVision stores persistent defaults in `%LOCALAPPDATA%\ARIA\MoldVision\config.json` (Windows) or the appropriate platform config directory. When `ARIA_SHARED_ROOT` is set, the lake defaults to `shared\lake`, shared predictive export discovery reads from `shared\ingest\moldtrace\training_rows\v1`, and `moldvision publish` targets the shared `published\...` tree automatically.
+MoldVision stores persistent defaults in `%LOCALAPPDATA%\ARIA\MoldVision\config.json` (Windows) or the appropriate platform config directory. When `ARIA_SHARED_ROOT` is set, the lake defaults to `shared\lake`, shared predictive export discovery reads from `shared\ingest\moldtrace\training_rows\v1` (the export catalog path is still `v1`, while the current row payload is `training_row_v2`), and `moldvision publish` targets the shared `published\...` tree automatically.
 
 ### Shared storage setup (recommended in full ARIA stack)
 
@@ -77,7 +77,7 @@ Important:
 
 With this setup:
 - MoldPilot writes qualification sessions to `shared\ingest\moldpilot\sessions\...`
-- MoldTrace writes predictive training exports to `shared\ingest\moldtrace\training_rows\v1\...`
+- MoldTrace writes predictive training exports to `shared\ingest\moldtrace\training_rows\v1\...` with `training_row_v2` JSONL payloads
 - MoldVision uses `shared\lake\...` as its lake root and publishes to `shared\published\...`
 
 ```powershell
@@ -224,7 +224,7 @@ Common training options:
 ## Predictive training (Startup Assistant)
 
 This is a separate ML workflow from RF-DETR CV training. It trains MoldPilot's
-Tier 1 Startup Assistant from **ARIA MoldTrace** `training_row_v1` JSONL exports,
+Tier 1 Startup Assistant from **ARIA MoldTrace** `training_row_v2` JSONL exports,
 using LightGBM models that MoldVision then converts to ONNX and packages as a
 `.sugbundle`.
 
@@ -253,8 +253,9 @@ moldvision predictive validate-dataset `
   --summary
 ```
 
-This checks schema validity, scope coverage, HMI schema consistency, and gives a
-training-readiness summary before you spend time training.
+This checks schema validity, scope coverage, HMI schema consistency, grouped
+control-family metadata, and gives a training-readiness summary before you spend
+time training.
 
 ### 3) Train the predictive models
 
@@ -271,6 +272,7 @@ Notes:
 - When the input JSONL already has a single mold/material/machine scope, `predictive train` inherits it automatically into `scope.json`. Explicit `--mold-id`, `--material-id`, and `--machine-id` flags override the inferred scope.
 - Scope your run with `--mold-id` and `--material-id` for production bundles when the dataset is mixed or incomplete.
 - If your dataset mixes machine families or HMI schemas, also pass `--machine-id <family>` to train one model per machine family.
+- `training_row_v2` carries `parameter_schema` and `control_families` metadata from MoldTrace. MoldVision preserves those grouped step semantics separately from flat feature pruning so a multi-step control family can be marked non-deployable if one member is pruned.
 - If `--output-dir` is omitted, MoldVision creates a new local run folder under `%LOCALAPPDATA%\ARIA\MoldVision\predictive_runs\` (or the configured `predictive-runs-root`).
 - Training writes `train_result.pkl` and `scope.json` into the chosen run directory.
 
@@ -291,8 +293,11 @@ This produces:
 - `runs\mold-a-v1\deploy\<bundle_id>.sugbundle`
 
 `predictive bundle` automatically reads `scope.json` from the training output.
-For production, keep scope complete so MoldPilot can select the correct bundle
-for the active mold/material.
+The bundle manifest now also carries `trained_feature_keys`, `parameter_schema`,
+`control_families`, and `deployable_control_families` so MoldPilot can search
+atomic multi-step controls coherently at runtime. For production, keep scope
+complete so MoldPilot can select the correct bundle for the active
+mold/material.
 
 ### 5) Publish or install in MoldPilot
 
@@ -664,7 +669,7 @@ See `docs/TOOLS.md` for notes and recommendations.
 | `docs/TRANSFER_AND_INFERENCE.md` | Model transfer and inference workflow notes |
 | `docs/BUNDLE_CONTRACT.md` | Bundle format spec for both CV `.mpk` bundles and predictive `.sugbundle` bundles |
 | `docs/LABELING_WORKFLOW.md` | Full Label Studio active-learning loop: pre-label → review → export → retrain |
-| `docs/MoldVision_Predictive_Model_Plan.md` | Predictive startup-assistant workflow: `training_row_v1` validation, `predictive train`, `.sugbundle` packaging |
+| `docs/MoldVision_Predictive_Model_Plan.md` | Predictive startup-assistant workflow: `training_row_v2` validation, `predictive train`, `.sugbundle` packaging |
 | `docs/ARIA_System_Integration.md` | Cross-system integration overview (MoldPilot, MoldTrace, MoldVision) |
 
 ## Dependencies

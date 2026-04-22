@@ -9,6 +9,7 @@ from pathlib import Path
 from moldvision.predictive.training_row_loader import (
     assess_training_readiness,
     check_schema_homogeneity,
+    extract_control_families,
     extract_parameter_schema,
     extract_feature_matrix,
     extract_targets,
@@ -250,6 +251,7 @@ class TestFeatureExtraction(unittest.TestCase):
                 parameter_schema=[
                     {
                         "parameter_id": "temp_barrel:zone_1",
+                        "family_id": "temp_barrel",
                         "page_id": "temperature",
                         "subpage_id": "barrel",
                         "canonical_parameter_id": "temp_barrel",
@@ -276,11 +278,100 @@ class TestFeatureExtraction(unittest.TestCase):
 
         self.assertEqual(len(schema), 1)
         self.assertEqual(schema[0]["parameter_id"], "temp_barrel:zone_1")
+        self.assertEqual(schema[0]["family_id"], "temp_barrel")
         self.assertEqual(schema[0]["page_id"], "temperature")
         self.assertEqual(schema[0]["subpage_id"], "barrel")
         self.assertEqual(schema[0]["canonical_parameter_id"], "temp_barrel")
         self.assertEqual(schema[0]["slot_id"], "zone_1")
         self.assertEqual(schema[0]["control_feature_keys"], ["temp_barrel:zone_1.setpoint_end"])
+
+    def test_extract_control_families_merges_dynamic_member_states(self) -> None:
+        rows = [
+            _make_row(
+                parameter_schema=[
+                    {
+                        "parameter_id": "pressure_injection:step_1",
+                        "family_id": "pressure_injection",
+                        "slot_id": "step_1",
+                        "canonical_slot_id": "step_1",
+                        "display_name": "Injection Pressure - Step 1",
+                        "control_feature_keys": ["pressure_injection:step_1.setpoint_end"],
+                    },
+                    {
+                        "parameter_id": "pressure_injection:step_2",
+                        "family_id": "pressure_injection",
+                        "slot_id": "step_2",
+                        "canonical_slot_id": "step_2",
+                        "display_name": "Injection Pressure - Step 2",
+                        "control_feature_keys": ["pressure_injection:step_2.setpoint_end"],
+                    },
+                ],
+            ),
+            _make_row(
+                session_id="sess_002",
+                parameter_schema=[
+                    {
+                        "parameter_id": "pressure_injection:step_1",
+                        "family_id": "pressure_injection",
+                        "slot_id": "step_1",
+                        "canonical_slot_id": "step_1",
+                        "display_name": "Injection Pressure - Step 1",
+                        "control_feature_keys": ["pressure_injection:step_1.setpoint_end"],
+                    },
+                    {
+                        "parameter_id": "pressure_injection:step_2",
+                        "family_id": "pressure_injection",
+                        "slot_id": "step_2",
+                        "canonical_slot_id": "step_2",
+                        "display_name": "Injection Pressure - Step 2",
+                        "control_feature_keys": ["pressure_injection:step_2.setpoint_end"],
+                    },
+                ],
+                features={
+                    "pressure_injection:step_1.setpoint_end": 800.0,
+                    "pressure_injection:step_2.setpoint_end": 700.0,
+                },
+                feature_keys=[
+                    "pressure_injection:step_1.setpoint_end",
+                    "pressure_injection:step_2.setpoint_end",
+                ],
+            ),
+        ]
+        rows[0]["context"]["control_families"] = [
+            {
+                "family_id": "pressure_injection",
+                "family_type": "atomic",
+                "activation_state": "partial",
+                "observability_state": "partial",
+                "ordered_members": [
+                    {
+                        "parameter_id": "pressure_injection:step_1",
+                        "canonical_slot_id": "step_1",
+                        "control_feature_keys": ["pressure_injection:step_1.setpoint_end"],
+                        "activation_state": "active",
+                        "observability_state": "observed",
+                    },
+                    {
+                        "parameter_id": "pressure_injection:step_2",
+                        "canonical_slot_id": "step_2",
+                        "control_feature_keys": ["pressure_injection:step_2.setpoint_end"],
+                        "activation_state": "inactive",
+                        "observability_state": "unobserved",
+                    },
+                ],
+            }
+        ]
+
+        families = extract_control_families(rows)
+
+        self.assertEqual(len(families), 1)
+        self.assertEqual(families[0]["family_id"], "pressure_injection")
+        self.assertEqual(families[0]["family_type"], "atomic")
+        self.assertIn("partial", families[0]["observed_activation_states"])
+        self.assertEqual(
+            [member["parameter_id"] for member in families[0]["ordered_members"]],
+            ["pressure_injection:step_1", "pressure_injection:step_2"],
+        )
 
 
 class TestExtractTargets(unittest.TestCase):
@@ -306,6 +397,9 @@ class TestSchemaHomogeneity(unittest.TestCase):
         result = check_schema_homogeneity(rows)
         self.assertTrue(result["homogeneous"])
         self.assertEqual(result["n_schemas"], 1)
+        self.assertTrue(result["layout_homogeneous"])
+        self.assertTrue(result["feature_set_homogeneous"])
+        self.assertFalse(result["dynamic_feature_variation"])
 
     def test_same_layout_with_different_active_slots_is_still_homogeneous(self) -> None:
         row1 = _make_row(feature_keys=["a.setpoint_end", "a.present"], features={"a.setpoint_end": 1.0, "a.present": 1.0})
@@ -324,6 +418,9 @@ class TestSchemaHomogeneity(unittest.TestCase):
 
         self.assertTrue(result["homogeneous"])
         self.assertEqual(result["n_schemas"], 1)
+        self.assertTrue(result["layout_homogeneous"])
+        self.assertFalse(result["feature_set_homogeneous"])
+        self.assertTrue(result["dynamic_feature_variation"])
 
     def test_heterogeneous(self) -> None:
         row1 = _make_row()
@@ -337,6 +434,8 @@ class TestSchemaHomogeneity(unittest.TestCase):
         result = check_schema_homogeneity([row1, row2])
         self.assertFalse(result["homogeneous"])
         self.assertEqual(result["n_schemas"], 2)
+        self.assertFalse(result["layout_homogeneous"])
+        self.assertFalse(result["dynamic_feature_variation"])
 
 
 class TestScopeDistribution(unittest.TestCase):
@@ -372,6 +471,9 @@ class TestSummarizeDataset(unittest.TestCase):
         self.assertEqual(summary["total_rows"], 2)
         self.assertEqual(summary["eligible_rows"], 1)
         self.assertIn("feature_columns", summary)
+        self.assertIn("layout_homogeneous", summary)
+        self.assertIn("feature_set_homogeneous", summary)
+        self.assertIn("dynamic_feature_variation", summary)
         self.assertIn("quality_score_stats", summary)
         self.assertIn("defect_counts", summary)
         self.assertIn("sink_mark", summary["defect_counts"])

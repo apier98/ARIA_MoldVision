@@ -1973,7 +1973,13 @@ def _handle_predictive_validate_dataset(args) -> int:
         print(f"Total rows:        {summary['total_rows']}")
         print(f"Eligible rows:     {summary['eligible_rows']}")
         print(f"Feature columns:   {summary['feature_columns']}")
-        print(f"Schema homogeneous:{summary['schema_homogeneous']}")
+        print(f"Layout homogeneous:{summary['layout_homogeneous']}")
+        print(f"Feature-set homogeneous:{summary['feature_set_homogeneous']}")
+        print(f"Legacy schema homogeneous:{summary['schema_homogeneous']}")
+        if summary.get("dynamic_feature_variation"):
+            print("Dynamic feature variation: detected (same layout, different active slot sets)")
+        if summary.get("family_activation_diverse"):
+            print("Family activation diversity: detected")
         qs = summary.get("quality_score_stats") or {}
         if qs.get("count"):
             print(f"Quality score:     min={qs['min']}  max={qs['max']}  mean={qs['mean']}  n={qs['count']}")
@@ -2136,15 +2142,21 @@ def _handle_predictive_train(args) -> int:
 
     # Warn on heterogeneous HMI schemas — training on mixed machine types degrades model quality.
     homogeneity = check_schema_homogeneity(rows)
-    if not homogeneity["homogeneous"]:
+    if not homogeneity["layout_homogeneous"]:
         layouts = homogeneity.get("hmi_layouts_seen", [])
         families = sorted({lay.get("machine_family") for lay in layouts if lay.get("machine_family")})
         print(
-            f"WARNING: Dataset contains {homogeneity['n_schemas']} distinct HMI schemas "
+            f"WARNING: Dataset contains {homogeneity['n_layout_schemas']} distinct layout contracts "
             f"(machine families: {families}). "
             "Training on heterogeneous schemas produces a union-schema model with sparse features "
             "that may have degraded accuracy. "
             "Recommended: re-run with --machine-id <family> to train one model per machine family."
+        )
+    elif homogeneity["dynamic_feature_variation"]:
+        print(
+            "INFO: Dataset keeps one layout contract but shows different active slot sets across rows. "
+            "This is expected for streamed machine data where steps can turn on/off dynamically; "
+            "training will use the union feature set."
         )
 
     cfg = GbtTrainingConfig(

@@ -155,7 +155,15 @@ def test_predictive_train_defaults_to_local_predictive_runs_root(
     ]
     mock_validate.return_value = {"valid": True, "invalid_rows": 0, "row_errors": []}
     mock_scope_distribution.return_value = {"distinct_scope_count": 1}
-    mock_homogeneity.return_value = {"homogeneous": True}
+    mock_homogeneity.return_value = {
+        "homogeneous": True,
+        "layout_homogeneous": True,
+        "feature_set_homogeneous": True,
+        "dynamic_feature_variation": False,
+        "family_activation_diverse": False,
+        "n_schemas": 1,
+        "n_layout_schemas": 1,
+    }
     mock_readiness.return_value = {"level": "good", "message": "ready"}
     mock_train.return_value = types.SimpleNamespace(
         targets={
