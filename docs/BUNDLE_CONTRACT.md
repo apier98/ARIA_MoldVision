@@ -293,10 +293,22 @@ Pack with `moldvision predictive bundle --pack` to produce `<name>.sugbundle`
 | `format_version` | `1` | Schema version (int) |
 | `created_at` | ISO 8601 string | UTC timestamp when bundle was written |
 | `feature_keys` | string[] | Ordered list of MoldTrace feature keys expected at inference |
+| `trained_feature_keys` | string[] | Flat feature columns that survived training-time pruning |
 | `imputation` | object | Mean imputation values: `{"<feature_key>": <float>, …}` — applied before inference when a feature is missing |
+| `parameter_schema` | object[] | Slot-level parameter metadata preserved from `training_row_v2` |
+| `control_families` | object[] | Grouped family metadata, including `family_constraints` when available |
+| `deployable_control_families` | object[] | Subset of control families that MoldPilot may turn into runtime suggestions |
 | `target_models` | object | Map of target name → ONNX filename: `{"quality_score": "model_quality_score.onnx", …}` |
 | `quality_weights` | object | Defect-to-quality weight map used by MoldPilot Tier 1 local search: `{"burn_mark": 0.20, "flash": 0.30, "sink_mark": 0.35, "weld_line": 0.15}` |
 | `checksums` | object | SHA-256 hex per ONNX file and `training_meta.json` |
+
+For startup-suggestion bundles, the important contract split is:
+
+- **trained flat feature space** → `feature_keys`, `trained_feature_keys`
+- **deployable operator action space** → `deployable_control_families` and their `family_constraints`
+
+MoldPilot must not infer deployable startup actions directly from whichever flat
+slot columns survived pruning.
 
 ### `training_meta.json` schema
 
@@ -316,22 +328,29 @@ Pack with `moldvision predictive bundle --pack` to produce `<name>.sugbundle`
 
 ### ONNX model conventions
 
-All five ONNX models follow the same contract:
+All startup-suggestion ONNX models follow the same contract:
 
 - **Input**: `float_input` — shape `[1, n_features]`, `float32`, NaN-safe
 - **Regression** (`quality_score`) — single output `variable` shape `[1, 1]`
-- **Classification** (`defect_*`) — two outputs:
+- **Regression** (`defect_*`) — single output `variable` shape `[1, 1]` when trained on burden/severity targets
+- **Classification** (`defect_*`) — legacy two-output form:
   - `label` — predicted class (unused by MoldPilot)
   - `probabilities` — shape `[1, 2]`; MoldPilot reads `probabilities[0][1]` (positive-class probability)
 - Exported with `onnxmltools.convert_lightgbm(..., zipmap=False)` — no ZipMap post-processing
 
+Current production direction is:
+
+- `quality_score` regression as the primary global target
+- per-defect **burden/severity regressors** as the preferred label-specific runtime targets
+- legacy binary classifiers kept only for backward compatibility
+
 ### Creating a `.sugbundle` (MoldVision)
 
 ```powershell
-# 1. Export training rows from ARIA MoldTrace (JSONL, training_row_v1 schema)
+# 1. Export training rows from ARIA MoldTrace (JSONL, training_row_v2 schema)
 #    Place in e.g. C:\data\training_rows.jsonl
 
-# 2. Train the five GBT models
+# 2. Train the startup-suggestion models
 moldvision predictive train `
   --input C:\data\training_rows.jsonl `
   --output-dir runs\suggest-v1 `
@@ -363,6 +382,11 @@ ref = registry.install_suggestion_bundle(
 
 Suggestion bundles are tracked in `registry_suggestions.json` alongside the
 main `registry.json` and stored under `models/suggestion_bundles/`.
+
+At runtime, MoldPilot still keeps the machine state **assumed / operator-confirmed**
+rather than live-read from the HMI. The bundle therefore provides the constraint
+metadata needed for grouped recipe search and validation around that assumed
+state, including deployable control families and family-level hard constraints.
 
 
 ---

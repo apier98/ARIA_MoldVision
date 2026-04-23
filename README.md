@@ -274,6 +274,7 @@ Notes:
 - Scope your run with `--mold-id` and `--material-id` for production bundles when the dataset is mixed or incomplete.
 - If your dataset mixes machine families or HMI schemas, also pass `--machine-id <family>` to train one model per machine family.
 - `training_row_v2` carries `parameter_schema` and `control_families` metadata from MoldTrace. MoldVision preserves those grouped step semantics separately from flat feature pruning so a multi-step control family can be marked non-deployable if one member is pruned.
+- `training_row_v2` also carries `family_constraints` inside `control_families`. MoldVision preserves that metadata in the suggestion bundle so MoldPilot can distinguish the **trained flat feature space** from the **deployable constrained action space**.
 - If `--output-dir` is omitted, MoldVision creates a new local run folder under `%LOCALAPPDATA%\ARIA\MoldVision\predictive_runs\` (or the configured `predictive-runs-root`).
 - Training writes `train_result.pkl` and `scope.json` into the chosen run directory.
 
@@ -299,6 +300,14 @@ The bundle manifest now also carries `trained_feature_keys`, `parameter_schema`,
 atomic multi-step controls coherently at runtime. For production, keep scope
 complete so MoldPilot can select the correct bundle for the active
 mold/material.
+
+Important runtime distinction:
+
+- `trained_feature_keys` describes what the LightGBM / ONNX scorer actually used
+- `deployable_control_families` + `family_constraints` describe what MoldPilot is allowed to suggest
+
+This means flat feature pruning is still allowed for training robustness, but it
+no longer defines the operator-facing startup action space by itself.
 
 ### 5) Publish or install in MoldPilot
 
