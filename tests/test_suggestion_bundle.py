@@ -44,6 +44,10 @@ def _make_row(session_id: str, i: int) -> dict:
             "y_burden_sink_mark": 0.6 if i % 4 == 0 else 0.0,
             "y_burden_burn_mark": 0.6 if i % 5 == 0 else 0.0,
             "y_burden_weld_line": 0.6 if i % 6 == 0 else 0.0,
+            "y_duration_ratio_flash": 0.6 if i % 3 == 0 else 0.0,
+            "y_duration_ratio_sink_mark": 0.6 if i % 4 == 0 else 0.0,
+            "y_duration_ratio_burn_mark": 0.6 if i % 5 == 0 else 0.0,
+            "y_duration_ratio_weld_line": 0.6 if i % 6 == 0 else 0.0,
         },
         "context": {
             "defect_classes_monitored": ["flash", "sink_mark"],
@@ -79,12 +83,12 @@ class TestWriteSuggestionBundle(unittest.TestCase):
         cfg = GbtTrainingConfig(n_estimators=5, cv_folds=2, min_rows=5)
         return train_suggestion_models(rows, config=cfg)
 
-    def _train_with_constant_flash_burden(self, n: int = 30):
+    def _train_with_constant_flash_duration_ratio(self, n: int = 30):
         from moldvision.predictive.trainer import GbtTrainingConfig, train_suggestion_models
 
         rows = [_make_row(f"sess_{i:03d}", i) for i in range(n)]
         for row in rows:
-            row["targets"]["y_burden_flash"] = 0.0
+            row["targets"]["y_duration_ratio_flash"] = 0.0
         cfg = GbtTrainingConfig(n_estimators=5, cv_folds=2, min_rows=5)
         return train_suggestion_models(rows, config=cfg)
 
@@ -187,7 +191,7 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             self.assertEqual(meta["trained_feature_keys"], result.feature_keys)
             self.assertIn("used_feature_keys", meta["cv_metrics"]["quality_score"])
             self.assertEqual(meta["cv_metrics"]["defect_flash"]["model_type"], "regression")
-            self.assertEqual(meta["cv_metrics"]["defect_flash"]["source_target"], "y_burden_flash")
+            self.assertEqual(meta["cv_metrics"]["defect_flash"]["source_target"], "y_duration_ratio_flash")
             self.assertEqual(meta["control_family_validation"], result.control_family_validation)
 
     def test_manifest_records_selected_feature_stats(self) -> None:
@@ -213,12 +217,12 @@ class TestWriteSuggestionBundle(unittest.TestCase):
             self.assertEqual(manifest["target_models"]["quality_score"]["model_type"], "regression")
             self.assertEqual(manifest["target_models"]["quality_score"]["source_target"], "y_quality_score")
             self.assertEqual(manifest["target_models"]["defect_flash"]["model_type"], "regression")
-            self.assertEqual(manifest["target_models"]["defect_flash"]["signal_kind"], "defect_burden")
+            self.assertEqual(manifest["target_models"]["defect_flash"]["signal_kind"], "duration_ratio")
 
     def test_bundle_omits_constant_targets(self) -> None:
         from moldvision.predictive.suggestion_bundle import write_suggestion_bundle
 
-        result = self._train_with_constant_flash_burden()
+        result = self._train_with_constant_flash_duration_ratio()
         with tempfile.TemporaryDirectory() as td:
             bundle_dir = write_suggestion_bundle(
                 Path(td), result, model_name="startup-suggestion", model_version="0.0.1"

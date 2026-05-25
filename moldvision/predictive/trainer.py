@@ -8,10 +8,10 @@ no Python ML dependencies on the shop floor.
 Targets
 -------
 - ``quality_score``     — regression  (``y_quality_score``, float 0–1)
-- ``defect_burn_mark``  — regression  (``y_burden_burn_mark``, float 0–1)
-- ``defect_flash``      — regression  (``y_burden_flash``, float 0–1)
-- ``defect_sink_mark``  — regression  (``y_burden_sink_mark``, float 0–1)
-- ``defect_weld_line``  — regression  (``y_burden_weld_line``, float 0–1)
+- ``defect_burn_mark``  — regression  (``y_duration_ratio_burn_mark``, float 0–1)
+- ``defect_flash``      — regression  (``y_duration_ratio_flash``, float 0–1)
+- ``defect_sink_mark``  — regression  (``y_duration_ratio_sink_mark``, float 0–1)
+- ``defect_weld_line``  — regression  (``y_duration_ratio_weld_line``, float 0–1)
 
 Usage::
 
@@ -42,10 +42,10 @@ from .training_row_loader import (
 
 SUGGESTION_TARGETS: Dict[str, Tuple[Literal["regression", "classification"], str, str, str]] = {
     "quality_score":    ("regression", "y_quality_score", "quality_score", "optimization"),
-    "defect_burn_mark": ("regression", "y_burden_burn_mark", "defect_burden", "optimization"),
-    "defect_flash":     ("regression", "y_burden_flash", "defect_burden", "optimization"),
-    "defect_sink_mark": ("regression", "y_burden_sink_mark", "defect_burden", "optimization"),
-    "defect_weld_line": ("regression", "y_burden_weld_line", "defect_burden", "optimization"),
+    "defect_burn_mark": ("regression", "y_duration_ratio_burn_mark", "duration_ratio", "optimization"),
+    "defect_flash":     ("regression", "y_duration_ratio_flash", "duration_ratio", "optimization"),
+    "defect_sink_mark": ("regression", "y_duration_ratio_sink_mark", "duration_ratio", "optimization"),
+    "defect_weld_line": ("regression", "y_duration_ratio_weld_line", "duration_ratio", "optimization"),
 }
 
 
@@ -57,13 +57,16 @@ SUGGESTION_TARGETS: Dict[str, Tuple[Literal["regression", "classification"], str
 class GbtTrainingConfig:
     """Hyper-parameters and training options for the GBT models."""
 
-    n_estimators: int = 300
+    n_estimators: int = 100
     learning_rate: float = 0.05
-    num_leaves: int = 31
-    min_child_samples: int = 5
+    num_leaves: int = 4
+    max_depth: int = 2
+    min_child_samples: int = 3
+    reg_alpha: float = 0.1
+    reg_lambda: float = 1.0
     n_jobs: int = -1
     random_state: int = 42
-    cv_folds: int = 5
+    cv_folds: int = 3
     early_stopping_rounds: int = 30
     null_strategy: Literal["native_missing", "mean_impute", "zero_impute"] = "native_missing"
     min_feature_presence_ratio: float = 0.05
@@ -251,7 +254,9 @@ def _selected_feature_keys(
     filtered: List[str] = []
     for key in feature_keys:
         if str(key).startswith("defect_state."):
-            filtered.append(str(key))
+            # Live defect signals are used by MoldPilot for trigger/focus logic.
+            # Keeping them as model inputs leaks the current outcome into the
+            # targets and weakens counterfactual local search.
             continue
         _, dot, stat = str(key).partition(".")
         if not dot:
@@ -423,7 +428,10 @@ def _regressor_kwargs(config: GbtTrainingConfig, *, n_rows: int) -> Dict[str, An
         "n_estimators": config.n_estimators,
         "learning_rate": config.learning_rate,
         "num_leaves": config.num_leaves,
+        "max_depth": config.max_depth,
         "min_child_samples": _effective_min_child_samples(config.min_child_samples, n_rows),
+        "reg_alpha": config.reg_alpha,
+        "reg_lambda": config.reg_lambda,
         "n_jobs": config.n_jobs,
         "random_state": config.random_state,
     }
@@ -434,7 +442,10 @@ def _classifier_kwargs(config: GbtTrainingConfig, *, n_rows: int) -> Dict[str, A
         "n_estimators": config.n_estimators,
         "learning_rate": config.learning_rate,
         "num_leaves": config.num_leaves,
+        "max_depth": config.max_depth,
         "min_child_samples": _effective_min_child_samples(config.min_child_samples, n_rows),
+        "reg_alpha": config.reg_alpha,
+        "reg_lambda": config.reg_lambda,
         "n_jobs": config.n_jobs,
         "random_state": config.random_state,
         "class_weight": "balanced",
@@ -456,6 +467,13 @@ def _effective_classification_cv_splits(y, requested_splits: int) -> int:
     if len(counts) < 2:
         return 0
     return max(0, min(int(requested_splits), int(len(y)), int(np.min(counts))))
+
+
+def _effective_group_cv_splits(groups: Sequence[object], requested_splits: int) -> int:
+    distinct = {str(group) for group in groups if str(group).strip()}
+    if len(distinct) < 2:
+        return 0
+    return min(int(requested_splits), len(distinct))
 
 
 def _used_feature_keys(model: Any, feature_keys: Sequence[str]) -> List[str]:
@@ -509,7 +527,7 @@ def train_suggestion_models(
     try:
         import lightgbm as lgb
         import numpy as np
-        from sklearn.model_selection import StratifiedKFold, KFold
+        from sklearn.model_selection import GroupKFold, StratifiedKFold, KFold
     except ImportError as exc:
         raise ImportError(
             "lightgbm and scikit-learn are required for predictive training. "
@@ -572,6 +590,13 @@ def train_suggestion_models(
         X = np.array(_impute(raw_matrix, zero_fill_values, feature_keys), dtype=np.float32)
 
     target_results: Dict[str, TargetResult] = {}
+    row_groups = np.array(
+        [
+            str(row.get("session_id") or f"row_{idx:05d}")
+            for idx, row in enumerate(eligible)
+        ],
+        dtype=object,
+    )
 
     for target_name, (model_type, jsonl_key, signal_kind, signal_role) in SUGGESTION_TARGETS.items():
         raw_y = extract_targets(eligible, jsonl_key)
@@ -580,6 +605,7 @@ def train_suggestion_models(
         valid_mask = [v is not None for v in raw_y]
         X_valid = X[valid_mask]
         y_valid = np.array([v for v in raw_y if v is not None], dtype=np.float32)
+        groups_valid = row_groups[valid_mask]
 
         if len(y_valid) < config.min_rows:
             # Not enough data for this target — skip silently with NaN metric.
@@ -595,7 +621,19 @@ def train_suggestion_models(
             model = lgb.LGBMRegressor(**model_kwargs)
             cv_splits = _effective_regression_cv_splits(len(y_valid), config.cv_folds)
             cv_scores = [0.0]
-            if cv_splits >= 2:
+            group_cv_splits = _effective_group_cv_splits(groups_valid, config.cv_folds)
+            if group_cv_splits >= 2:
+                cv = GroupKFold(n_splits=group_cv_splits)
+                cv_scores = _cv_score_regression(
+                    lgb.LGBMRegressor,
+                    model_kwargs,
+                    X_valid,
+                    y_valid,
+                    cv,
+                    lgb,
+                    groups=groups_valid,
+                )
+            elif cv_splits >= 2:
                 cv = KFold(n_splits=cv_splits, shuffle=True, random_state=config.random_state)
                 cv_scores = _cv_score_regression(
                     lgb.LGBMRegressor,
@@ -623,7 +661,19 @@ def train_suggestion_models(
             model = lgb.LGBMClassifier(**model_kwargs)
             cv_splits = _effective_classification_cv_splits(y_valid, config.cv_folds)
             cv_scores = [0.5]
-            if cv_splits >= 2:
+            group_cv_splits = _effective_group_cv_splits(groups_valid, config.cv_folds)
+            if group_cv_splits >= 2:
+                cv = GroupKFold(n_splits=group_cv_splits)
+                cv_scores = _cv_score_classification(
+                    lgb.LGBMClassifier,
+                    model_kwargs,
+                    X_valid,
+                    y_valid,
+                    cv,
+                    lgb,
+                    groups=groups_valid,
+                )
+            elif cv_splits >= 2:
                 cv = StratifiedKFold(
                     n_splits=cv_splits,
                     shuffle=True,
@@ -688,11 +738,12 @@ def train_suggestion_models(
 # CV helpers (avoids direct sklearn pipeline to keep LightGBM callbacks)
 # ---------------------------------------------------------------------------
 
-def _cv_score_regression(model_cls, model_kwargs, X, y, cv, lgb) -> List[float]:
+def _cv_score_regression(model_cls, model_kwargs, X, y, cv, lgb, groups=None) -> List[float]:
     from sklearn.metrics import mean_squared_error
 
     scores = []
-    for train_idx, val_idx in cv.split(X):
+    split_iter = cv.split(X, groups=groups) if groups is not None else cv.split(X)
+    for train_idx, val_idx in split_iter:
         m = model_cls(
             **{
                 **model_kwargs,
@@ -708,12 +759,13 @@ def _cv_score_regression(model_cls, model_kwargs, X, y, cv, lgb) -> List[float]:
     return scores
 
 
-def _cv_score_classification(model_cls, model_kwargs, X, y, cv, lgb) -> List[float]:
+def _cv_score_classification(model_cls, model_kwargs, X, y, cv, lgb, groups=None) -> List[float]:
     import numpy as np
     from sklearn.metrics import roc_auc_score
 
     scores = []
-    for train_idx, val_idx in cv.split(X, y):
+    split_iter = cv.split(X, groups=groups) if groups is not None else cv.split(X, y)
+    for train_idx, val_idx in split_iter:
         if len(np.unique(y[train_idx])) < 2 or len(np.unique(y[val_idx])) < 2:
             continue
         m = model_cls(

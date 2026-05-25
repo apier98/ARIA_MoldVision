@@ -52,6 +52,10 @@ def _make_row(
             "y_burden_sink_mark": 0.6 if defect_sink_mark else 0.0,
             "y_burden_burn_mark": 0.6 if defect_burn_mark else 0.0,
             "y_burden_weld_line": 0.6 if defect_weld_line else 0.0,
+            "y_duration_ratio_flash": 0.6 if defect_flash else 0.0,
+            "y_duration_ratio_sink_mark": 0.6 if defect_sink_mark else 0.0,
+            "y_duration_ratio_burn_mark": 0.6 if defect_burn_mark else 0.0,
+            "y_duration_ratio_weld_line": 0.6 if defect_weld_line else 0.0,
         },
         "context": {
             "defect_classes_monitored": ["flash", "sink_mark", "burn_mark", "weld_line"],
@@ -141,8 +145,8 @@ class TestGbtTrainer(unittest.TestCase):
 
         defect_target = result.targets["defect_flash"]
         self.assertEqual(defect_target.model_type, "regression")
-        self.assertEqual(defect_target.source_target, "y_burden_flash")
-        self.assertEqual(defect_target.signal_kind, "defect_burden")
+        self.assertEqual(defect_target.source_target, "y_duration_ratio_flash")
+        self.assertEqual(defect_target.signal_kind, "duration_ratio")
         self.assertEqual(defect_target.cv_metric_name, "rmse")
 
     def test_constant_regression_target_is_skipped(self) -> None:
@@ -150,7 +154,7 @@ class TestGbtTrainer(unittest.TestCase):
 
         rows = _make_rows(30)
         for row in rows:
-            row["targets"]["y_burden_flash"] = 0.0
+            row["targets"]["y_duration_ratio_flash"] = 0.0
 
         result = train_suggestion_models(rows, config=self.config)
 
@@ -254,6 +258,10 @@ class TestGbtTrainer(unittest.TestCase):
                         "y_burden_sink_mark": 0.0,
                         "y_burden_burn_mark": 0.0,
                         "y_burden_weld_line": 0.0,
+                        "y_duration_ratio_flash": 0.6 if i % 3 == 0 else 0.0,
+                        "y_duration_ratio_sink_mark": 0.0,
+                        "y_duration_ratio_burn_mark": 0.0,
+                        "y_duration_ratio_weld_line": 0.0,
                     },
                     "context": {
                         "defect_classes_monitored": ["flash"],
@@ -336,6 +344,10 @@ class TestGbtTrainer(unittest.TestCase):
                         "y_burden_sink_mark": 0.0,
                         "y_burden_burn_mark": 0.0,
                         "y_burden_weld_line": 0.0,
+                        "y_duration_ratio_flash": 0.6 if i % 3 == 0 else 0.0,
+                        "y_duration_ratio_sink_mark": 0.0,
+                        "y_duration_ratio_burn_mark": 0.0,
+                        "y_duration_ratio_weld_line": 0.0,
                     },
                     "context": {
                         "defect_classes_monitored": ["flash"],
@@ -415,6 +427,10 @@ class TestGbtTrainer(unittest.TestCase):
                         "y_burden_sink_mark": 0.0,
                         "y_burden_burn_mark": 0.0,
                         "y_burden_weld_line": 0.0,
+                        "y_duration_ratio_flash": 0.6 if i % 3 == 0 else 0.0,
+                        "y_duration_ratio_sink_mark": 0.0,
+                        "y_duration_ratio_burn_mark": 0.0,
+                        "y_duration_ratio_weld_line": 0.0,
                     },
                     "context": {
                         "defect_classes_monitored": ["flash"],

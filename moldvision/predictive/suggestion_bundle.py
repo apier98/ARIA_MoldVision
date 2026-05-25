@@ -4,7 +4,7 @@ A ``.sugbundle`` is a renamed ``.zip`` file containing:
 
 - ``manifest.json``             — identity, feature schema, target model metadata, checksums
 - ``model_quality_score.onnx``  — LightGBM regression → float quality score
-- ``model_defect_*.onnx``       — LightGBM regression → continuous per-defect burden signals
+- ``model_defect_*.onnx``       — LightGBM regression → continuous per-defect frame-ratio signals
 - ``training_meta.json``        — provenance (n_rows, CV metrics, date, dataset source)
 
 The bundle is consumed by MoldPilot's ``SuggestionBundleReader`` which uses the
@@ -127,6 +127,21 @@ def write_suggestion_bundle(
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     weights = quality_weights or DEFAULT_QUALITY_WEIGHTS
+    parameter_schema = (
+        list(train_result.parameter_schema)
+        if train_result.parameter_schema
+        else _derive_fallback_parameter_schema(train_result)
+    )
+    control_families = (
+        list(train_result.control_families)
+        if train_result.control_families
+        else _derive_fallback_control_families(parameter_schema)
+    )
+    deployable_control_families = (
+        list(train_result.deployable_control_families)
+        if train_result.deployable_control_families
+        else list(control_families)
+    )
 
     # Export each trained target to ONNX.
     target_models: Dict[str, dict] = {}
@@ -194,9 +209,9 @@ def write_suggestion_bundle(
         "feature_keys":    train_result.feature_keys,
         "context_feature_keys": list(train_result.context_feature_keys),
         "trained_feature_keys": list(train_result.feature_keys),
-        "parameter_schema": train_result.parameter_schema,
-        "control_families": train_result.control_families,
-        "deployable_control_families": train_result.deployable_control_families,
+        "parameter_schema": parameter_schema,
+        "control_families": control_families,
+        "deployable_control_families": deployable_control_families,
         "imputation_values": {
             k: round(v, 8) for k, v in train_result.imputation_values.items()
         },
@@ -248,3 +263,74 @@ def pack_sugbundle(bundle_dir: Path) -> Path:
 def _save_json(path: Path, data: object) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
+
+
+def _derive_fallback_parameter_schema(train_result: TrainResult) -> List[dict]:
+    schema: List[dict] = []
+    for feature_key in train_result.feature_keys:
+        if str(feature_key).startswith("defect_state."):
+            continue
+        baseline = float(train_result.imputation_values.get(feature_key, 0.0))
+        span = max(abs(baseline) * 0.5, 1.0)
+        range_min = max(0.0, baseline - span) if baseline >= 0.0 else baseline - span
+        range_max = baseline + span
+        token = str(feature_key).lower()
+        if any(key in token for key in ("temp", "temperature", "barrel", "melt", "mold")):
+            preferred_step = 1.0
+            max_delta = min(max(preferred_step * 5.0, 5.0), span * 0.10 if span > 0 else preferred_step * 5.0)
+        elif any(key in token for key in ("pressure", "press", "_p_", "pressione")):
+            preferred_step = max(1.0, round(span * 0.02, 3))
+            max_delta = min(max(preferred_step * 4.0, 10.0), span * 0.10 if span > 0 else preferred_step * 4.0)
+        elif any(key in token for key in ("speed", "flow", "dose", "dosaggio", "iniettare", "vite", "screw", "_q_")):
+            preferred_step = max(1.0, round(span * 0.02, 3))
+            max_delta = min(max(preferred_step * 4.0, 5.0), span * 0.10 if span > 0 else preferred_step * 4.0)
+        else:
+            preferred_step = max(1.0 if abs(baseline) >= 10.0 else 1.0, round(span * 0.02, 3))
+            max_delta = min(max(preferred_step * 4.0, preferred_step), span * 0.10 if span > 0 else preferred_step * 4.0)
+        schema.append(
+            {
+                "parameter_id": str(feature_key),
+                "display_name": str(feature_key).replace("_", " "),
+                "unit": "setpoint",
+                "baseline": baseline,
+                "range_min": round(float(range_min), 6),
+                "range_max": round(float(range_max), 6),
+                "control_feature_keys": [str(feature_key)],
+                "trained_control_feature_keys": [str(feature_key)],
+                "family_id": str(feature_key),
+                "semantic_parameter_id": str(feature_key),
+                "step_mode": "absolute",
+                "preferred_step": round(float(preferred_step), 6),
+                "max_delta": round(float(max(max_delta, preferred_step)), 6),
+                "deployable": True,
+            }
+        )
+    return schema
+
+
+def _derive_fallback_control_families(parameter_schema: List[dict]) -> List[dict]:
+    families: List[dict] = []
+    for item in parameter_schema:
+        parameter_id = str(item.get("parameter_id", "")).strip()
+        if not parameter_id:
+            continue
+        families.append(
+            {
+                "family_id": parameter_id,
+                "display_name": str(item.get("display_name", parameter_id)),
+                "family_type": "single_slot",
+                "parameter_ids": [parameter_id],
+                "ordered_members": [{"parameter_id": parameter_id}],
+                "semantic_parameter_id": str(item.get("semantic_parameter_id", parameter_id)),
+                "family_constraints": {
+                    "ordered_slots": False,
+                    "dynamic_activation": False,
+                    "activation_semantics": "single",
+                    "shape_preserving_only": False,
+                    "allowed_recipe_types": ["single_step"],
+                    "controllable_member_parameter_ids": [parameter_id],
+                },
+                "deployable": True,
+            }
+        )
+    return families

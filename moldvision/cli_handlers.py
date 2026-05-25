@@ -1806,6 +1806,8 @@ def handle_predictive(args) -> int:
         return _handle_predictive_train(args)
     if subcmd == "bundle":
         return _handle_predictive_bundle(args)
+    if subcmd == "simulate":
+        return _handle_predictive_simulate(args)
     print(f"Unknown predictive sub-command: {subcmd}")
     return 2
 
@@ -2017,8 +2019,8 @@ def _handle_predictive_validate_dataset(args) -> int:
 def _handle_predictive_train(args) -> int:
     """Handle ``predictive train``.
 
-    Trains one LightGBM model per suggestion target (quality score + 4 defect
-    classifiers) and writes ``train_result.pkl`` + ``training_meta.json`` to
+    Trains one LightGBM model per suggestion target (quality score + 4 per-label
+    frame-ratio regressors) and writes ``train_result.pkl`` + ``training_meta.json`` to
     ``--output-dir``.
     """
     import pickle
@@ -2358,6 +2360,65 @@ def _handle_predictive_bundle(args) -> int:
 
     print("\nDone.")
     return 0
+
+
+def _handle_predictive_simulate(args) -> int:
+    import json
+
+    from .predictive.simulator import (
+        format_simulation_report,
+        results_to_jsonable,
+        simulate_bundle_scenarios,
+    )
+
+    bundle_path = resolve_path(args.bundle)
+    scenario_path = resolve_path(args.scenario)
+    json_out_path = resolve_path(args.json_out) if getattr(args, "json_out", None) else None
+
+    if not bundle_path.exists():
+        print(f"ERROR: Bundle path not found: {bundle_path}")
+        return 2
+    if not scenario_path.exists():
+        print(f"ERROR: Scenario path not found: {scenario_path}")
+        return 2
+
+    try:
+        results = simulate_bundle_scenarios(
+            bundle_path,
+            scenario_path,
+            default_metric_id=str(getattr(args, "default_metric_id", "duration_ratio")),
+            default_threshold=float(getattr(args, "default_threshold", 0.10)),
+            closed_loop_assume_apply=bool(getattr(args, "closed_loop_assume_apply", False)),
+        )
+    except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: Simulation failed — {exc}")
+        return 2
+
+    if getattr(args, "stop_on_fail", False):
+        failing = []
+        for result in results:
+            if result.expectations.get("checked") and not result.expectations.get("passed"):
+                failing.append(result)
+                break
+        if failing:
+            results = failing
+
+    payload = results_to_jsonable(results)
+    if str(getattr(args, "output_format", "text")) == "json":
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_simulation_report(results))
+
+    if json_out_path is not None:
+        json_out_path.parent.mkdir(parents=True, exist_ok=True)
+        json_out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"JSON transcript written to {json_out_path}")
+
+    has_failures = any(
+        result.expectations.get("checked") and not result.expectations.get("passed")
+        for result in results
+    )
+    return 3 if has_failures else 0
 
 
 # ── publish ────────────────────────────────────────────────────────────────

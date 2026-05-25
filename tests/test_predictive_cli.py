@@ -123,6 +123,51 @@ def test_predictive_bundle_can_publish_directly(mock_write_bundle, mock_publish,
     assert "Published:" in capsys.readouterr().out
 
 
+@patch("moldvision.predictive.simulator.simulate_bundle_scenarios")
+def test_predictive_simulate_returns_failure_exit_code_on_expectation_failure(mock_simulate, tmp_path, capsys) -> None:
+    from moldvision.cli_handlers import _handle_predictive_simulate
+    from moldvision.predictive.simulator import SimulationStepResult
+
+    bundle_path = tmp_path / "bundle.sugbundle"
+    bundle_path.write_text("stub", encoding="utf-8")
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text("[]", encoding="utf-8")
+
+    mock_simulate.return_value = [
+        SimulationStepResult(
+            step_id="shot_01",
+            metric_id="duration_ratio",
+            metric_value=0.4,
+            threshold=0.1,
+            triggered=False,
+            focus_label="flash",
+            baseline_quality_score=0.55,
+            predicted_label_signals={"flash": 0.33},
+            suggestion=None,
+            expectations={
+                "checked": True,
+                "passed": False,
+                "failures": ["must_trigger expected True, got False"],
+            },
+        )
+    ]
+
+    args = types.SimpleNamespace(
+        bundle=str(bundle_path),
+        scenario=str(scenario_path),
+        output_format="text",
+        json_out=None,
+        stop_on_fail=False,
+        default_threshold=0.10,
+        default_metric_id="duration_ratio",
+    )
+
+    rc = _handle_predictive_simulate(args)
+
+    assert rc == 3
+    assert "Expectations: FAIL" in capsys.readouterr().out
+
+
 @patch("moldvision.predictive.trainer.train_suggestion_models")
 @patch("moldvision.predictive.training_row_loader.assess_training_readiness")
 @patch("moldvision.predictive.training_row_loader.check_schema_homogeneity")

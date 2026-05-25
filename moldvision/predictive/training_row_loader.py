@@ -193,12 +193,12 @@ def assess_training_readiness(n_eligible_rows: int) -> Dict[str, str]:
     if n_eligible_rows < 50:
         return {
             "level": "poor",
-            "message": "Model is likely to overfit; prefer Tier 0 only.",
+            "message": "Trainable as a weak bootstrap prior; expect high variance and rely on runtime adaptation.",
         }
     if n_eligible_rows < 150:
         return {
             "level": "weak",
-            "message": "Trainable, but expect degraded accuracy.",
+            "message": "Trainable with moderate confidence; validate carefully before publishing.",
         }
     if n_eligible_rows < 300:
         return {
@@ -759,3 +759,4 @@ def align_to_union_schema(
     if union_keys is None:
         union_keys = compute_union_feature_keys(rows)
     return extract_feature_matrix(rows, feature_keys=union_keys)
+

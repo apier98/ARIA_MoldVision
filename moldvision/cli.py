@@ -676,12 +676,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to write trained model artifacts. Default: a new run folder under the local predictive-runs root.",
     )
     pred_train.add_argument(
-        "--cv-folds", type=int, default=5,
-        help="Number of cross-validation folds (default: 5)",
+        "--cv-folds", type=int, default=3,
+        help="Number of cross-validation folds (default: 3)",
     )
     pred_train.add_argument(
-        "--n-estimators", type=int, default=300,
-        help="Number of LightGBM boosting rounds (default: 300)",
+        "--n-estimators", type=int, default=100,
+        help="Number of LightGBM boosting rounds (default: 100)",
     )
     pred_train.add_argument(
         "--learning-rate", type=float, default=0.05,
@@ -769,6 +769,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dry-run the publish step and print the resulting catalog/index metadata",
     )
 
+    pred_sim = pred_sub.add_parser(
+        "simulate",
+        help="Replay startup-assistant scenario files against a suggestion bundle",
+    )
+    pred_sim.add_argument(
+        "--bundle", required=True,
+        help="Path to a startup-suggestion bundle directory or .sugbundle archive",
+    )
+    pred_sim.add_argument(
+        "--scenario", required=True,
+        help="Path to a JSON or JSONL scenario replay file",
+    )
+    pred_sim.add_argument(
+        "--output-format", choices=["text", "json"], default="text",
+        help="Console output format (default: text)",
+    )
+    pred_sim.add_argument(
+        "--json-out", default=None,
+        help="Optional path to write the full simulation transcript as JSON",
+    )
+    pred_sim.add_argument(
+        "--stop-on-fail", action="store_true",
+        help="Stop replay at the first failed expectation",
+    )
+    pred_sim.add_argument(
+        "--default-threshold", type=float, default=0.10,
+        help="Default trigger threshold when a scenario step omits it (default: 0.10)",
+    )
+    pred_sim.add_argument(
+        "--default-metric-id", default="duration_ratio",
+        help="Default watched metric when a scenario step omits metric_id (default: duration_ratio)",
+    )
+    pred_sim.add_argument(
+        "--closed-loop-assume-apply", action="store_true",
+        help="Carry forward suggested parameter values into subsequent steps by default.",
+    )
+
     # ---- publish ----
     sp_publish = sub.add_parser("publish", help="Publish a model bundle to the S3 model catalog")
     sp_publish.add_argument("bundle_path", type=str, help="Path to bundle directory or .mpk/.zip")
@@ -822,3 +859,4 @@ def main(argv: List[str] | None = None) -> int:
 
     build_parser().parse_args(["--help"])
     return 2
+
