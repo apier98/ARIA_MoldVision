@@ -95,6 +95,35 @@ def _resolve_onnx_input_dtype(input_meta: Any, *, fallback_dtype: Optional[str] 
     return np.dtype(np.float32)
 
 
+def _select_onnx_providers(ort: Any, device_str: Optional[str], manifest_providers: Optional[List[str]] = None) -> List[str]:
+    try:
+        available = set(ort.get_available_providers())
+    except Exception:
+        available = set()
+
+    requested = str(device_str or "").strip().lower()
+    if requested == "cpu":
+        return ["CPUExecutionProvider"]
+
+    candidates: List[str]
+    if requested.startswith("cuda"):
+        candidates = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    elif requested in {"dml", "directml"}:
+        candidates = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    else:
+        # Auto mode: prefer DirectML when available, otherwise fall back to CPU.
+        # Ignore manifest CUDA entries here so Windows doesn't silently drift to CUDA
+        # when the CUDA stack is incomplete or unavailable.
+        candidates = ["DmlExecutionProvider", "CPUExecutionProvider"]
+        if manifest_providers and "DmlExecutionProvider" in manifest_providers:
+            candidates = ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+    filtered = [provider for provider in candidates if provider in available]
+    if "CPUExecutionProvider" not in filtered:
+        filtered.append("CPUExecutionProvider")
+    return filtered
+
+
 def _run_tensorrt_inference(
     *,
     bundle_dir: Path,
@@ -323,14 +352,7 @@ def _run_onnx_inference(
     if not onnx_path.exists():
         return InferResult(False, None, f"ONNX model not found: {onnx_path}")
 
-    providers = ["CPUExecutionProvider"]
-    try:
-        available = set(ort.get_available_providers())
-    except Exception:
-        available = set()
-    wants_cuda = (device is None) or str(device).lower().startswith("cuda")
-    if wants_cuda and "CUDAExecutionProvider" in available:
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    providers = _select_onnx_providers(ort, device)
 
     try:
         session = ort.InferenceSession(str(onnx_path), providers=providers)
@@ -687,15 +709,12 @@ class InferenceEngine:
         if cand_onnx:
             try:
                 import onnxruntime as ort
-                providers = ["CPUExecutionProvider"]
-                try:
-                    available = set(ort.get_available_providers())
-                except Exception:
-                    available = set()
-                wants_cuda = (self.device_str is None) or str(self.device_str).lower().startswith("cuda")
-                if wants_cuda and "CUDAExecutionProvider" in available:
-                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                
+                manifest = self.cfg.get("manifest.json", {}) or self.cfg.get("bundle_manifest.json", {}) or {}
+                providers = _select_onnx_providers(
+                    ort,
+                    self.device_str,
+                    manifest.get("runtime", {}).get("providers"),
+                )
                 self.session = ort.InferenceSession(str(cand_onnx), providers=providers)
                 self.active_backend = "onnx"
                 return

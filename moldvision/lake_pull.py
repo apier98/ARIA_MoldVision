@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import shutil
 import uuid as _uuid
 from collections import Counter, defaultdict
@@ -67,12 +68,24 @@ def _merge_session_coco(
         return existing, next_img_id, next_ann_id
 
     fname_set = set(selected_fnames)
+    ordinal_to_fname: Dict[str, str] = {}
+    for fname in selected_fnames:
+        m = re.match(r"^(\d+)__", fname)
+        if m:
+            ordinal_to_fname[m.group(1)] = fname
     img_id_map: Dict[int, int] = {}
 
     for im in src.get("images", []):
-        if im.get("file_name") not in fname_set:
+        raw_name = Path(im.get("file_name", "")).name
+        resolved_name = raw_name if raw_name in fname_set else None
+        if resolved_name is None:
+            m = re.match(r"^(?:[0-9A-Fa-f]{8}-)?(\d+)__", raw_name)
+            if m:
+                resolved_name = ordinal_to_fname.get(m.group(1))
+        if resolved_name is None:
             continue
         new_im = {k: v for k, v in im.items() if k != "id"}
+        new_im["file_name"] = resolved_name
         new_im["id"] = next_img_id
         img_id_map[im["id"]] = next_img_id
         existing["images"].append(new_im)

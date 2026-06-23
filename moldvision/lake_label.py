@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import shutil
 import uuid as _uuid
 from collections import defaultdict
@@ -395,6 +396,12 @@ def label_batch_commit(
 
     # Build frame filename → rel_path map from batch metadata
     fname_to_rel: Dict[str, str] = {Path(rp).name: rp for rp in batch_frames}
+    ordinal_to_rel: Dict[str, str] = {}
+    for rp in batch_frames:
+        name = Path(rp).name
+        m = re.match(r"^(\d+)__", name)
+        if m:
+            ordinal_to_rel[m.group(1)] = rp
 
     def _candidate_export_names(raw_file_name: str) -> List[str]:
         """Return possible filenames that may map an export image to batch frames.
@@ -412,6 +419,20 @@ def label_batch_commit(
             if len(prefix) == 8 and all(c in "0123456789abcdefABCDEF" for c in prefix):
                 out.append(rest)
         return out
+
+    def _ordinal_rel_path(raw_file_name: str) -> Optional[str]:
+        """Fallback: map by the batch-local ordinal prefix ``00001__...``.
+
+        Label Studio exports can rewrite the tail of the filename while preserving
+        the leading batch ordinal, which is stable within one batch.
+        """
+        for candidate in _candidate_export_names(raw_file_name):
+            m = re.match(r"^(\d+)__", candidate)
+            if m:
+                rel_path = ordinal_to_rel.get(m.group(1))
+                if rel_path:
+                    return rel_path
+        return None
 
     # Find and parse COCO export
     coco_path = _find_export_coco(batch_abs, coco_json_path)
@@ -436,6 +457,8 @@ def label_batch_commit(
             rel_path = fname_to_rel.get(candidate)
             if rel_path:
                 break
+        if not rel_path:
+            rel_path = _ordinal_rel_path(im.get("file_name", ""))
         if not rel_path:
             skipped_count += 1
             continue

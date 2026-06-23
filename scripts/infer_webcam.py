@@ -34,9 +34,6 @@ except Exception:
 import numpy as np
 from PIL import Image
 
-import torch
-import torchvision.transforms as T
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="ARIA_MoldVision: Webcam inference (display only)")
@@ -135,7 +132,8 @@ def instantiate_model(task: str, size: str, num_classes: Optional[int] = None):
     raise ValueError(size)
 
 
-def try_load_weights(model, path: str, device: torch.device, checkpoint_key: str = None, verbose: bool = False, allow_replace_model: bool = False):
+def try_load_weights(model, path: str, device, checkpoint_key: str = None, verbose: bool = False, allow_replace_model: bool = False):
+    torch, _ = _require_torch()
     if not path:
         return False, None
     if not os.path.exists(path):
@@ -331,7 +329,8 @@ def try_load_weights(model, path: str, device: torch.device, checkpoint_key: str
     return False, None
 
 
-def preprocess_frame_to_tensor(frame: np.ndarray, device: torch.device) -> torch.Tensor:
+def preprocess_frame_to_tensor(frame: np.ndarray, device):
+    _, T = _require_torch()
     # Ensure frame is HxWx3 BGR
     try:
         if frame is None:
@@ -367,7 +366,8 @@ def preprocess_frame_to_tensor(frame: np.ndarray, device: torch.device) -> torch
     return t
 
 
-def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
+def tensor_to_pil(tensor) -> Image.Image:
+    _, T = _require_torch()
     try:
         t = tensor.detach().cpu().squeeze(0)
         t = T.ToPILImage()(t)
@@ -379,6 +379,7 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 def run_inference(model, module_for_torch, tensor: torch.Tensor):
     """Try several inference call patterns and return raw output."""
+    torch, _ = _require_torch()
     last_exc = None
 
     def _looks_empty(o) -> bool:
@@ -473,6 +474,7 @@ def run_inference(model, module_for_torch, tensor: torch.Tensor):
 
 
 def _normalize_masks(masks, mask_thresh: float) -> Optional[List[np.ndarray]]:
+    torch, _ = _require_torch()
     if masks is None:
         return None
     if isinstance(masks, list):
@@ -499,6 +501,7 @@ def _normalize_masks(masks, mask_thresh: float) -> Optional[List[np.ndarray]]:
 
 def parse_detections(output, img_w: int, img_h: int, score_thresh: float, want_masks: bool, mask_thresh: float):
     """Return boxes, scores, labels, masks (masks optional)."""
+    torch, _ = _require_torch()
     boxes: List[List[float]] = []
     scores: List[float] = []
     labels: List[int] = []
@@ -677,25 +680,36 @@ def draw_detections(frame: np.ndarray, boxes: List[List[float]], scores: List[fl
 
 
 def load_onnx_session(onnx_path: str, device_str: Optional[str]):
-    """Create an onnxruntime InferenceSession, preferring CUDA if available."""
+    """Create an onnxruntime InferenceSession, preferring DirectML on Windows."""
     try:
         import onnxruntime as ort
     except ImportError:
         raise RuntimeError("onnxruntime is not installed. Run: pip install onnxruntime-gpu")
-    providers = ["CPUExecutionProvider"]
+    requested = str(device_str or "").strip().lower()
     try:
         available = set(ort.get_available_providers())
     except Exception:
         available = set()
-    wants_cuda = device_str is None or str(device_str).lower().startswith("cuda")
-    if wants_cuda and "CUDAExecutionProvider" in available:
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    if requested == "cpu":
+        providers = ["CPUExecutionProvider"]
+    elif requested.startswith("cuda"):
+        providers = [p for p in ["CUDAExecutionProvider", "CPUExecutionProvider"] if p in available]
+        if not providers:
+            providers = ["CPUExecutionProvider"]
+    elif requested in {"dml", "directml"}:
+        providers = [p for p in ["DmlExecutionProvider", "CPUExecutionProvider"] if p in available]
+        if not providers:
+            providers = ["CPUExecutionProvider"]
+    else:
+        # Auto mode: prefer DirectML when available, otherwise fall back to CPU.
+        providers = [p for p in ["DmlExecutionProvider", "CPUExecutionProvider"] if p in available]
+        if not providers:
+            providers = ["CPUExecutionProvider"]
     session = ort.InferenceSession(onnx_path, providers=providers)
     print(f"ONNX Runtime providers in use: {session.get_providers()}")
-    # Warn when loading an fp16 model without TensorRT: onnxruntime's CUDA provider
-    # lacks fp16 kernels for some ops (Sqrt, Tile), causing Memcpy roundtrips that
-    # are slower than fp32 on CUDA. Use model.onnx (fp32) for onnxruntime inference;
-    # fp16 ONNX is designed as an intermediate for TensorRT export.
+    # Warn when loading an fp16 model without TensorRT: if CUDA was explicitly
+    # requested, some ops can fall back to CPU and run slower than fp32.
     try:
         inp_type = str(session.get_inputs()[0].type).lower()
         using_cuda = any("cuda" in p.lower() for p in session.get_providers())
@@ -792,12 +806,10 @@ def main():
         print("Error: --onnx-model is required when --backend onnx")
         return
 
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"Using device: {device}")
-
     class_names = load_class_names(args.classes_file) if args.classes_file else []
 
     if args.backend == "onnx":
+        print(f"Using ONNX Runtime device preference: {args.device or 'auto'}")
         session = load_onnx_session(args.onnx_model, args.device)
         target_h, target_w = onnx_input_hw(session)
 
@@ -807,6 +819,9 @@ def main():
                 args.threshold, args.task == "seg", args.mask_thresh,
             )
     else:
+        torch, _ = _require_torch()
+        device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        print(f"Using device: {device}")
         if args.task == "seg" and args.size != "nano":
             print("Note: --size is ignored for --task seg")
 
@@ -935,3 +950,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+def _require_torch():
+    try:
+        import torch
+        import torchvision.transforms as T
+    except ImportError as exc:
+        raise RuntimeError("PyTorch and torchvision are required for the PyTorch backend.") from exc
+    return torch, T

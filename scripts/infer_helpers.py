@@ -12,10 +12,20 @@ Keep this as a lightweight dependency: only requires torch and numpy; `rfdetr` i
 
 from __future__ import annotations
 
-from typing import Tuple, List, Optional, Any, Union
+from typing import TYPE_CHECKING, Tuple, List, Optional, Any, Union
 import os
-import torch
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
+
+
+def _require_torch():
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("PyTorch is required for checkpoint or PyTorch inference helpers.") from exc
+    return torch
 
 
 def instantiate_model(size: str, num_classes: Optional[int] = None, task: str = "detect"):
@@ -85,6 +95,7 @@ def instantiate_model(size: str, num_classes: Optional[int] = None, task: str = 
 def detect_model_size_from_checkpoint(path: str, checkpoint_key: Optional[str] = None) -> Optional[str]:
     if not path or not os.path.exists(path):
         return None
+    torch = _require_torch()
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
@@ -133,6 +144,7 @@ def detect_model_size_from_checkpoint(path: str, checkpoint_key: Optional[str] =
 def read_checkpoint_args(path: str) -> Optional[object]:
     if not path or not os.path.exists(path):
         return None
+    torch = _require_torch()
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
@@ -145,6 +157,7 @@ def read_checkpoint_args(path: str) -> Optional[object]:
 def detect_num_classes_from_checkpoint(path: str, checkpoint_key: Optional[str] = None, verbose: bool = False) -> Optional[int]:
     if not path or not os.path.exists(path):
         return None
+    torch = _require_torch()
     try:
         ckpt = torch.load(path, map_location="cpu")
     except Exception:
@@ -186,6 +199,7 @@ def detect_num_classes_from_checkpoint(path: str, checkpoint_key: Optional[str] 
 
 def find_load_target(obj, max_depth=3):
     """Find an inner object that supports load_state_dict or is an nn.Module."""
+    _require_torch()
     import torch.nn as nn
     if hasattr(obj, "load_state_dict") and callable(getattr(obj, "load_state_dict")):
         return obj
@@ -237,7 +251,7 @@ def _set_module_by_path(root, path: str, new_mod):
 def load_checkpoint_weights(
     model,
     path: str,
-    device: torch.device,
+    device: "torch.device",
     checkpoint_key: Optional[str] = None,
     allow_replace_model: bool = False,
     verbose: bool = False,
@@ -254,6 +268,7 @@ def load_checkpoint_weights(
         return False, None
     if verbose:
         print(f"Loading weights from {path}")
+    torch = _require_torch()
     try:
         ckpt = torch.load(path, map_location=device)
     except Exception as e:
@@ -499,6 +514,7 @@ def _normalize_masks_to_bool(masks: Any, score_thresh: float = 0.0) -> Optional[
     """Accept masks in many shapes/types and return list of boolean HxW arrays."""
     if masks is None:
         return None
+    torch = _require_torch()
 
     # supervision sometimes uses "mask" with shape (N,H,W) or list of arrays
     if isinstance(masks, list):
@@ -550,6 +566,11 @@ def parse_model_output(
     scores: List[float] = []
     labels: List[int] = []
     masks: Optional[List[np.ndarray]] = None
+    torch = None
+    try:
+        torch = _require_torch()
+    except RuntimeError:
+        pass
 
     # supervision-like objects
     try:
@@ -654,7 +675,7 @@ def parse_model_output(
                 b = out["boxes"]
                 s = out.get("scores", None)
                 l = out.get("labels", out.get("classes", None))
-                if isinstance(b, torch.Tensor):
+                if torch is not None and isinstance(b, torch.Tensor):
                     b = b.detach().cpu()
                     if b.numel() == 0:
                         if return_masks:
@@ -687,7 +708,7 @@ def parse_model_output(
 
             if "pred_boxes" in out:
                 pb = out["pred_boxes"]
-                if isinstance(pb, torch.Tensor):
+                if torch is not None and isinstance(pb, torch.Tensor):
                     pb_cpu = pb.detach().cpu()
                     maxv = float(pb_cpu.max())
                     if maxv <= 1.0:
@@ -730,7 +751,7 @@ def parse_model_output(
                         return boxes, scores, labels, masks
                     return boxes, scores, labels
 
-        if isinstance(output, torch.Tensor):
+        if torch is not None and isinstance(output, torch.Tensor):
             t = output.detach().cpu()
             if t.ndim == 2 and t.shape[1] >= 6:
                 for i in range(t.shape[0]):

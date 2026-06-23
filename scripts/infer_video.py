@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import cv2
-import torch
 
 from infer_helpers import (
     detect_model_size_from_checkpoint,
@@ -32,10 +31,18 @@ from infer_webcam import (
 from moldvision.checkpoints import load_checkpoint_weights
 from moldvision.infer import InferenceEngine
 from moldvision.postprocess import letterbox_pil, parse_model_output_generic, unletterbox_mask, unletterbox_xyxy
-from moldvision.torch_compat import unwrap_torch_module
-import torchvision.transforms as T
 from PIL import Image
 import numpy as np
+
+
+def _require_torch():
+    try:
+        import torch
+        import torchvision.transforms as T
+        from moldvision.torch_compat import unwrap_torch_module
+    except ImportError as exc:
+        raise RuntimeError("PyTorch and torchvision are required for the PyTorch backend.") from exc
+    return torch, T, unwrap_torch_module
 
 
 def parse_args():
@@ -115,7 +122,8 @@ def resolve_output_path(args) -> Path | None:
     return None
 
 
-def preprocess_frame_to_tensor(frame, device: torch.device, *, target_w: int, target_h: int):
+def preprocess_frame_to_tensor(frame, device, *, target_w: int, target_h: int):
+    _, T, _ = _require_torch()
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     pil_in, lb = letterbox_pil(pil, target_w=int(target_w), target_h=int(target_h))
@@ -124,6 +132,7 @@ def preprocess_frame_to_tensor(frame, device: torch.device, *, target_w: int, ta
 
 
 def run_official_predict(model, frame_bgr, *, threshold: float):
+    torch, _, _ = _require_torch()
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     predict_fn = getattr(model, "predict", None)
@@ -185,11 +194,10 @@ def main():
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"Using device: {device}")
     class_names = load_class_names(args.classes_file) if args.classes_file else []
     bundle_dir = _infer_bundle_dir(args)
     engine = None
+    device = None
 
     if bundle_dir is not None:
         if args.verbose:
@@ -216,6 +224,7 @@ def main():
         onnx_target_h = None
         onnx_target_w = None
     elif args.backend == "onnx":
+        print(f"Using ONNX Runtime device preference: {args.device or 'auto'}")
         if not args.onnx_model:
             print("Error: --onnx-model is required when --backend onnx")
             return
@@ -225,6 +234,9 @@ def main():
         module_for_torch = None
         infer_resolution = onnx_target_w
     else:
+        torch, _, unwrap_torch_module = _require_torch()
+        device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        print(f"Using device: {device}")
         if not args.weights:
             print("Error: --weights is required when --backend pytorch")
             return
@@ -296,6 +308,7 @@ def main():
     writer = None
     processed = 0
     warned_no_masks = False
+    display_enabled = bool(args.display)
 
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS))
@@ -404,14 +417,18 @@ def main():
             if writer is not None:
                 writer.write(disp)
 
-            if args.display:
+            if display_enabled:
                 shown = disp
                 if args.width and args.width > 0 and shown.shape[1] != args.width:
                     scale = float(args.width) / float(shown.shape[1])
                     shown = cv2.resize(shown, (args.width, int(shown.shape[0] * scale)), interpolation=cv2.INTER_AREA)
-                cv2.imshow("ARIA_MoldVision Video Inference (press q to quit)", shown)
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    break
+                try:
+                    cv2.imshow("ARIA_MoldVision Video Inference (press q to quit)", shown)
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        break
+                except cv2.error as exc:
+                    print(f"Warning: OpenCV display is unavailable in this environment; continuing without --display. ({exc})")
+                    display_enabled = False
 
             processed += 1
             if args.verbose and processed % 25 == 0:
@@ -425,8 +442,11 @@ def main():
         cap.release()
         if writer is not None:
             writer.release()
-        if args.display:
-            cv2.destroyAllWindows()
+        if display_enabled:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
 
     if out_path is not None:
         print(f"Wrote overlay video to: {out_path}")
